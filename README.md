@@ -31,6 +31,7 @@ python routenet/routenet_tf2.py \
     --train_dir data/routenet/nsfnetbw/tfrecords/train/ \
     --eval_dir data/routenet/nsfnetbw/tfrecords/evaluate/ \
     --model_dir models/routenet_tf2_model \
+    --target delay \
     --epochs 20 \
     --batch_size 32 \
     --learning_rate 0.001
