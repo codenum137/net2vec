@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RouteNet TF2 模型评估和可视化脚本
-加载训练好的模型权重，进行预测并绘制结果分析图
+RouteNet TF2 综合模型评估脚本
+支持评估delay/jitter和drops两种不同的模型，并绘制相对误差CDF图
+支持同拓扑（nsfnet）和跨拓扑（gbn）评估
 """
 
 import tensorflow as tf
@@ -18,56 +19,83 @@ import sys
 sys.path.append(os.path.dirname(__file__))
 from routenet.routenet_tf2 import (
     RouteNet, create_dataset, parse_fn, transformation_func,
-    scale_fn, heteroscedastic_loss
+    scale_fn, heteroscedastic_loss, binomial_loss, create_model_and_loss_fn
 )
 
-def evaluate_model(model, dataset, num_samples=None):
+def load_model(model_dir, target, config):
     """
-    评估模型并收集预测结果
+    加载指定目标的模型
     
     Args:
-        model: 训练好的 RouteNet 模型
-        dataset: 测试数据集
-        num_samples: 限制评估的样本数量，None表示评估全部
+        model_dir: 模型目录路径
+        target: 'delay' 或 'drops'
+        config: 模型配置
     
     Returns:
-        predictions: 模型预测结果
-        ground_truth: 真实标签
+        model: 加载了权重的模型
+    """
+    # 根据target创建相应的模型
+    model, _ = create_model_and_loss_fn(config, target)
+    
+    # 寻找权重文件
+    weight_files = [
+        os.path.join(model_dir, "best_{}_model.weights.h5".format(target)),
+        os.path.join(model_dir, "best_model.weights.h5"),
+        os.path.join(model_dir, "model.weights.h5")
+    ]
+    
+    weight_path = None
+    for path in weight_files:
+        if os.path.exists(path):
+            weight_path = path
+            break
+    
+    if weight_path is None:
+        raise FileNotFoundError("No model weights found in {}".format(model_dir))
+    
+    print("Loading {} model weights from: {}".format(target, weight_path))
+    
+    return model, weight_path
+
+def evaluate_delay_jitter_model(model, dataset, num_samples=None):
+    """
+    评估延迟/抖动预测模型
+    
+    Args:
+        model: 延迟预测模型 (输出2维: [loc, scale])
+        dataset: 测试数据集
+        num_samples: 限制评估的样本数量
+    
+    Returns:
+        predictions: 预测结果
+        ground_truth: 真实值
         relative_errors: 相对误差
     """
-    predictions = {'delay': [], 'jitter': [], 'drops': []}
-    ground_truth = {'delay': [], 'jitter': [], 'drops': []}
+    predictions = {'delay': [], 'jitter': []}
+    ground_truth = {'delay': [], 'jitter': []}
     
     sample_count = 0
     
-    for features, labels in tqdm(dataset, desc="Evaluating model"):
-        # 模型预测
+    for features, labels in tqdm(dataset, desc="Evaluating delay/jitter model"):
+        # 模型预测 - 异方差输出：[loc, scale]
         pred = model(features, training=False)
         
-        # 异方差输出：[loc, scale]
         pred_delay = pred[:, 0].numpy()  # 延迟预测均值
-        pred_scale = tf.nn.softplus(pred[:, 1]).numpy()  # 标准差
+        pred_scale = tf.nn.softplus(pred[:, 1]).numpy()  # 预测的标准差
+        
+        # 根据异方差模型，抖动可以近似为标准差
+        pred_jitter = pred_scale
         
         # 收集真实值
         true_delay = labels['delay'].numpy()
-        true_jitter = labels['jitter'].numpy() 
-        true_drops = labels['drops'].numpy()
-        true_packets = labels['packets'].numpy()
-        
-        # 计算预测的抖动（这里简化处理，实际中可能需要更复杂的逻辑）
-        pred_jitter = pred_scale  # 使用预测的不确定性作为抖动的代理
-        
-        # 计算预测的丢包（简化为零，因为当前模型主要针对延迟）
-        pred_drops = np.zeros_like(true_drops)
+        true_jitter = labels['jitter'].numpy()
         
         # 存储结果
         predictions['delay'].extend(pred_delay)
         predictions['jitter'].extend(pred_jitter)
-        predictions['drops'].extend(pred_drops)
         
         ground_truth['delay'].extend(true_delay)
         ground_truth['jitter'].extend(true_jitter)
-        ground_truth['drops'].extend(true_drops)
         
         sample_count += len(pred_delay)
         if num_samples and sample_count >= num_samples:
@@ -81,184 +109,314 @@ def evaluate_model(model, dataset, num_samples=None):
     # 计算相对误差
     relative_errors = {}
     for key in predictions:
-        # 避免除以零的情况
         mask = np.abs(ground_truth[key]) > 1e-10
         rel_error = np.full_like(predictions[key], np.nan)
         rel_error[mask] = (predictions[key][mask] - ground_truth[key][mask]) / ground_truth[key][mask]
-        relative_errors[key] = rel_error
+        relative_errors[key] = rel_error[~np.isnan(rel_error)]
     
     return predictions, ground_truth, relative_errors
 
-def plot_cdf_comparison(relative_errors, save_path=None):
+def evaluate_drops_model(model, dataset, num_samples=None):
     """
-    绘制相对误差的CDF对比图，复刻您展示的图像风格
+    评估丢包预测模型
     
     Args:
-        relative_errors: 相对误差字典
-        save_path: 保存图像的路径
+        model: 丢包预测模型 (输出1维: logits)
+        dataset: 测试数据集  
+        num_samples: 限制评估的样本数量
+    
+    Returns:
+        predictions: 预测结果
+        ground_truth: 真实值
+        relative_errors: 相对误差
     """
-    plt.figure(figsize=(10, 8))
+    predictions = {'drops': []}
+    ground_truth = {'drops': []}
+    
+    sample_count = 0
+    
+    for features, labels in tqdm(dataset, desc="Evaluating drops model"):
+        # 模型预测 - 输出 logits
+        pred_logits = model(features, training=False)
+        pred_probs = tf.nn.sigmoid(pred_logits[:, 0]).numpy()
+        
+        # 收集真实值
+        true_drops = labels['drops'].numpy()
+        true_packets = labels['packets'].numpy()
+        
+        # 计算真实丢包率和预测丢包率
+        true_drop_rates = true_drops / (true_packets + 1e-10)  # 避免除零
+        pred_drop_rates = pred_probs  # sigmoid输出本身就是概率/丢包率
+        
+        # 存储结果
+        predictions['drops'].extend(pred_drop_rates)
+        ground_truth['drops'].extend(true_drop_rates)
+        
+        sample_count += len(pred_drop_rates)
+        if num_samples and sample_count >= num_samples:
+            break
+    
+    # 转换为numpy数组
+    for key in predictions:
+        predictions[key] = np.array(predictions[key])
+        ground_truth[key] = np.array(ground_truth[key])
+    
+    # 计算相对误差
+    relative_errors = {}
+    for key in predictions:
+        # 对于丢包率，只有当真实丢包率大于某个阈值时才计算相对误差
+        # 因为丢包率很小时，相对误差会非常大
+        mask = ground_truth[key] > 1e-6  # 只考虑丢包率大于0.0001%的情况
+        rel_error = np.full_like(predictions[key], np.nan)
+        rel_error[mask] = (predictions[key][mask] - ground_truth[key][mask]) / ground_truth[key][mask]
+        relative_errors[key] = rel_error[~np.isnan(rel_error)]
+    
+    return predictions, ground_truth, relative_errors
+
+def plot_comprehensive_cdf(nsfnet_errors, gbn_errors, output_path):
+    """
+    绘制综合的相对误差CDF图，包含三种指标和两种拓扑
+    
+    Args:
+        nsfnet_errors: nsfnet拓扑的相对误差
+        gbn_errors: gbn拓扑的相对误差  
+        output_path: 保存路径
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
     
     # 设置颜色和线型
-    colors = {'delay': 'black', 'jitter': 'gray', 'drops': 'lightgray'}
-    linestyles = {'test': '-', 'gbn': '--', 'pred': ':', 'model': '-.'}
+    colors = {'delay': '#1f77b4', 'jitter': '#ff7f0e', 'drops': '#2ca02c'}
+    linestyles = {'nsfnet': '-', 'gbn': '--'}
     
-    # 为每种指标绘制CDF
-    for metric, errors in relative_errors.items():
-        # 过滤掉 NaN 值
-        valid_errors = errors[~np.isnan(errors)]
-        if len(valid_errors) == 0:
-            continue
-            
-        # 计算CDF
-        sorted_errors = np.sort(valid_errors)
-        n = len(sorted_errors)
-        y = np.arange(1, n + 1) / n
+    # 收集所有误差数据以确定合适的范围
+    all_errors = []
+    for errors_dict in [nsfnet_errors, gbn_errors]:
+        for metric in ['delay', 'jitter', 'drops']:
+            if metric in errors_dict and len(errors_dict[metric]) > 0:
+                all_errors.extend(np.abs(errors_dict[metric]))
+    
+    # 左图：对数刻度，显示完整范围
+    ax = ax1
+    for metric in ['delay', 'jitter', 'drops']:
+        if metric in nsfnet_errors and len(nsfnet_errors[metric]) > 0:
+            sorted_errors = np.sort(np.abs(nsfnet_errors[metric]))
+            cdf_values = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
+            ax.plot(sorted_errors, cdf_values, 
+                    color=colors[metric], linestyle=linestyles['nsfnet'],
+                    linewidth=2.5, label='NSFNet {}'.format(metric.upper()))
         
-        # 绘制曲线
-        if metric == 'delay':
-            plt.plot(sorted_errors, y, color=colors[metric], linestyle='-', 
-                    linewidth=2, label=f'Test {metric}')
-            plt.plot(sorted_errors, y, color=colors[metric], linestyle='--', 
-                    linewidth=2, label=f'GBN {metric}')
-        elif metric == 'jitter':
-            plt.plot(sorted_errors, y, color=colors[metric], linestyle='-', 
-                    linewidth=1.5, label=f'Test {metric}')
-            plt.plot(sorted_errors, y, color=colors[metric], linestyle='--', 
-                    linewidth=1.5, label=f'GBN {metric}')
-        else:  # drops
-            plt.plot(sorted_errors, y, color=colors[metric], linestyle=':', 
-                    linewidth=1, label=f'Test {metric}')
-            plt.plot(sorted_errors, y, color=colors[metric], linestyle=':', 
-                    linewidth=1, label=f'GBN {metric}')
+        if metric in gbn_errors and len(gbn_errors[metric]) > 0:
+            sorted_errors = np.sort(np.abs(gbn_errors[metric]))
+            cdf_values = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
+            ax.plot(sorted_errors, cdf_values,
+                    color=colors[metric], linestyle=linestyles['gbn'],
+                    linewidth=2.5, label='GBN {}'.format(metric.upper()))
     
-    # 设置图像属性
-    plt.xlabel('ε', fontsize=14)
-    plt.ylabel('P(ε* ≤ ε)', fontsize=14)
-    plt.grid(True, alpha=0.3)
-    plt.legend(loc='lower right')
-    plt.xlim(-1.0, 1.0)
-    plt.ylim(0.0, 1.0)
+    # 添加理想情况的参考线（垂直线在x=0处）
+    ax.axvline(x=0, color='red', linestyle=':', linewidth=2, alpha=0.7, label='Ideal (Zero Error)')
     
-    # 添加标题
-    plt.title('Relative Error CDF Comparison', fontsize=16, fontweight='bold')
+    ax.set_xlabel('Relative Error (Absolute Value)', fontsize=12)
+    ax.set_ylabel('CDF', fontsize=12)
+    ax.set_title('Relative Error CDF - Log Scale\n(Closer to red line is better)', fontsize=14)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='lower right', fontsize=10)
     
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"CDF plot saved to {save_path}")
+    if all_errors:
+        min_error = np.min(all_errors)
+        max_error = np.max(all_errors)
+        ax.set_xscale('log')
+        x_min = max(min_error * 0.1, 1e-8)
+        x_max = max_error * 2
+        ax.set_xlim(x_min, x_max)
+    else:
+        ax.set_xlim(1e-6, 10)
+    ax.set_ylim(0, 1)
     
-    plt.show()
-
-def plot_detailed_analysis(predictions, ground_truth, relative_errors, save_dir=None):
-    """
-    绘制详细的分析图，包括散点图、误差分布等
-    """
-    if save_dir and not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-    
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.suptitle('RouteNet Model Performance Analysis', fontsize=16, fontweight='bold')
-    
-    metrics = ['delay', 'jitter', 'drops']
-    
-    for i, metric in enumerate(metrics):
-        pred = predictions[metric]
-        true = ground_truth[metric]
-        rel_err = relative_errors[metric]
+    # 右图：线性刻度，聚焦于小误差区域
+    ax = ax2
+    for metric in ['delay', 'jitter', 'drops']:
+        if metric in nsfnet_errors and len(nsfnet_errors[metric]) > 0:
+            sorted_errors = np.sort(np.abs(nsfnet_errors[metric]))
+            cdf_values = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
+            ax.plot(sorted_errors, cdf_values, 
+                    color=colors[metric], linestyle=linestyles['nsfnet'],
+                    linewidth=2.5, label='NSFNet {}'.format(metric.upper()))
         
-        # 过滤有效数据
-        valid_mask = ~np.isnan(rel_err)
-        pred_valid = pred[valid_mask]
-        true_valid = true[valid_mask]
-        rel_err_valid = rel_err[valid_mask]
-        
-        if len(pred_valid) == 0:
-            continue
-        
-        # 第一行：预测 vs 真实值散点图
-        axes[0, i].scatter(true_valid, pred_valid, alpha=0.5, s=1)
-        min_val = min(np.min(true_valid), np.min(pred_valid))
-        max_val = max(np.max(true_valid), np.max(pred_valid))
-        axes[0, i].plot([min_val, max_val], [min_val, max_val], 'r--', alpha=0.8)
-        axes[0, i].set_xlabel(f'True {metric}')
-        axes[0, i].set_ylabel(f'Predicted {metric}')
-        axes[0, i].set_title(f'{metric.capitalize()} Prediction')
-        axes[0, i].grid(True, alpha=0.3)
-        
-        # 第二行：相对误差分布
-        axes[1, i].hist(rel_err_valid, bins=50, alpha=0.7, density=True, color='skyblue')
-        axes[1, i].axvline(np.mean(rel_err_valid), color='red', linestyle='--', 
-                          label=f'Mean: {np.mean(rel_err_valid):.3f}')
-        axes[1, i].axvline(np.median(rel_err_valid), color='green', linestyle='--',
-                          label=f'Median: {np.median(rel_err_valid):.3f}')
-        axes[1, i].set_xlabel('Relative Error')
-        axes[1, i].set_ylabel('Density')
-        axes[1, i].set_title(f'{metric.capitalize()} Relative Error Distribution')
-        axes[1, i].legend()
-        axes[1, i].grid(True, alpha=0.3)
+        if metric in gbn_errors and len(gbn_errors[metric]) > 0:
+            sorted_errors = np.sort(np.abs(gbn_errors[metric]))
+            cdf_values = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
+            ax.plot(sorted_errors, cdf_values,
+                    color=colors[metric], linestyle=linestyles['gbn'],
+                    linewidth=2.5, label='GBN {}'.format(metric.upper()))
+    
+    # 添加理想情况的参考线
+    ax.axvline(x=0, color='red', linestyle=':', linewidth=2, alpha=0.7, label='Ideal (Zero Error)')
+    
+    ax.set_xlabel('Relative Error (Absolute Value)', fontsize=12)
+    ax.set_ylabel('CDF', fontsize=12)
+    ax.set_title('Relative Error CDF - Linear Scale\n(Focus on small errors)', fontsize=14)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='lower right', fontsize=10)
+    
+    # 线性刻度，聚焦于0到合理范围
+    if all_errors:
+        p90_error = np.percentile(all_errors, 90)
+        ax.set_xlim(0, min(p90_error * 1.5, 1.0))
+    else:
+        ax.set_xlim(0, 0.5)
+    ax.set_ylim(0, 1)
+    
+    # 添加统计信息到两个子图
+    stats_text = []
+    for topo in ['nsfnet', 'gbn']:
+        errors = nsfnet_errors if topo == 'nsfnet' else gbn_errors
+        for metric in ['delay', 'jitter', 'drops']:
+            if metric in errors and len(errors[metric]) > 0:
+                median_error = np.median(np.abs(errors[metric]))
+                p90_error = np.percentile(np.abs(errors[metric]), 90)
+                p95_error = np.percentile(np.abs(errors[metric]), 95)
+                stats_text.append('{} {}: Med={:.4f}, P90={:.4f}, P95={:.4f}'.format(
+                    topo.upper(), metric.upper(), median_error, p90_error, p95_error))
+    
+    # 在左图添加统计信息
+    stats_str = '\n'.join(stats_text)
+    ax1.text(0.02, 0.98, stats_str, transform=ax1.transAxes, 
+             fontsize=9, verticalalignment='top', 
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+    
+    # 添加性能解释文本到右图
+    explanation_text = ("Performance Interpretation:\n" +
+                       "• Ideal: Vertical line at x=0\n" +
+                       "• Better: Curve closer to x=0\n" +
+                       "• Steep rise near 0: High accuracy\n" +
+                       "• Gradual rise: Lower accuracy")
+    ax2.text(0.98, 0.02, explanation_text, transform=ax2.transAxes, 
+             fontsize=9, horizontalalignment='right', verticalalignment='bottom',
+             bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
     
     plt.tight_layout()
-    
-    if save_dir:
-        plt.savefig(os.path.join(save_dir, 'detailed_analysis.png'), 
-                   dpi=300, bbox_inches='tight')
-        print(f"Detailed analysis saved to {save_dir}/detailed_analysis.png")
-    
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.show()
-
-def print_metrics_summary(predictions, ground_truth, relative_errors):
-    """打印评估指标摘要"""
-    print("\n" + "="*60)
-    print("MODEL EVALUATION SUMMARY")
-    print("="*60)
+    print("Comprehensive CDF plot saved to: {}".format(output_path))
+    
+    # 创建单独的线性刻度图，更清楚地显示小误差区域
+    plt.figure(figsize=(12, 8))
     
     for metric in ['delay', 'jitter', 'drops']:
-        pred = predictions[metric]
-        true = ground_truth[metric]
-        rel_err = relative_errors[metric]
+        if metric in nsfnet_errors and len(nsfnet_errors[metric]) > 0:
+            # 不取绝对值，保留正负信息
+            sorted_errors = np.sort(nsfnet_errors[metric])  # 注意：这里不取abs()
+            cdf_values = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
+            plt.plot(sorted_errors, cdf_values, 
+                    color=colors[metric], linestyle=linestyles['nsfnet'],
+                    linewidth=2.5, label='NSFNet {}'.format(metric.upper()))
         
-        # 过滤有效数据
-        valid_mask = ~np.isnan(rel_err)
-        pred_valid = pred[valid_mask]
-        true_valid = true[valid_mask]
-        rel_err_valid = rel_err[valid_mask]
+        if metric in gbn_errors and len(gbn_errors[metric]) > 0:
+            # 不取绝对值，保留正负信息
+            sorted_errors = np.sort(gbn_errors[metric])  # 注意：这里不取abs()
+            cdf_values = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
+            plt.plot(sorted_errors, cdf_values,
+                    color=colors[metric], linestyle=linestyles['gbn'],
+                    linewidth=2.5, label='GBN {}'.format(metric.upper()))
+    
+    # 添加理想情况的参考线
+    plt.axvline(x=0, color='red', linestyle=':', linewidth=3, alpha=0.8, label='Ideal (Zero Error)')
+    
+    plt.xlabel('Relative Error (Positive: Over-prediction, Negative: Under-prediction)', fontsize=14)
+    plt.ylabel('CDF', fontsize=14)
+    plt.title('Relative Error CDF - Linear Scale with Positive/Negative Errors\n(Ideal is Vertical Red Line at 0)', fontsize=16)
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc='center right', fontsize=12)
+    
+    # 收集所有误差（包括正负值）来设置x轴范围
+    all_signed_errors = []
+    for errors_dict in [nsfnet_errors, gbn_errors]:
+        for metric in ['delay', 'jitter', 'drops']:
+            if metric in errors_dict and len(errors_dict[metric]) > 0:
+                all_signed_errors.extend(errors_dict[metric])  # 不取绝对值
+    
+    if all_signed_errors:
+        min_error = np.min(all_signed_errors)
+        max_error = np.max(all_signed_errors)
+        # 使用对称的范围，以0为中心
+        max_abs_error = max(abs(min_error), abs(max_error))
+        # 限制在合理范围内，并确保显示负值部分
+        display_range = min(max_abs_error * 1.2, 1.0)
+        plt.xlim(-display_range, display_range)
+    else:
+        plt.xlim(-0.5, 0.5)
+    plt.ylim(0, 1)
+    
+    # 更新统计信息，包含正负误差的信息
+    detailed_stats = []
+    for topo in ['nsfnet', 'gbn']:
+        errors = nsfnet_errors if topo == 'nsfnet' else gbn_errors
+        for metric in ['delay', 'jitter', 'drops']:
+            if metric in errors and len(errors[metric]) > 0:
+                mean_error = np.mean(errors[metric])  # 包含符号的平均误差
+                abs_errors = np.abs(errors[metric])
+                median_abs_error = np.median(abs_errors)
+                detailed_stats.append('{} {}: Mean={:.4f}, |Med|={:.4f}'.format(
+                    topo.upper(), metric.upper(), mean_error, median_abs_error))
+    
+    detailed_stats_str = '\n'.join(detailed_stats)
+    plt.text(0.02, 0.98, detailed_stats_str, transform=plt.gca().transAxes, 
+             fontsize=10, verticalalignment='top', 
+             bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
+    
+    output_path_linear = output_path.replace('.png', '_linear_focus.png')
+    plt.tight_layout()
+    plt.savefig(output_path_linear, dpi=300, bbox_inches='tight')
+    plt.show()
+    print("Linear scale CDF plot with positive/negative errors saved to: {}".format(output_path_linear))
+
+def print_evaluation_summary(nsfnet_errors, gbn_errors):
+    """
+    打印评估摘要统计
+    """
+    print("\n" + "="*60)
+    print("EVALUATION SUMMARY")
+    print("="*60)
+    
+    for topo_name, errors in [('NSFNet (Same Topology)', nsfnet_errors), ('GBN (Different Topology)', gbn_errors)]:
+        print("\n{}:".format(topo_name))
+        print("-" * 40)
         
-        if len(rel_err_valid) == 0:
-            print(f"{metric.upper()}: No valid predictions")
-            continue
-        
-        # 计算各种指标
-        mae = np.mean(np.abs(pred_valid - true_valid))
-        rmse = np.sqrt(np.mean((pred_valid - true_valid) ** 2))
-        mape = np.mean(np.abs(rel_err_valid)) * 100
-        
-        print(f"\n{metric.upper()}:")
-        print(f"  MAE (Mean Absolute Error): {mae:.6f}")
-        print(f"  RMSE (Root Mean Square Error): {rmse:.6f}")
-        print(f"  MAPE (Mean Absolute Percentage Error): {mape:.2f}%")
-        print(f"  Relative Error - Mean: {np.mean(rel_err_valid):.6f}")
-        print(f"  Relative Error - Std: {np.std(rel_err_valid):.6f}")
-        print(f"  Relative Error - 95% Quantile: {np.percentile(np.abs(rel_err_valid), 95):.6f}")
+        for metric in ['delay', 'jitter', 'drops']:
+            if metric in errors and len(errors[metric]) > 0:
+                abs_errors = np.abs(errors[metric])
+                unit = " (drop rate)" if metric == 'drops' else ""
+                print("  {}{}: {} samples".format(metric.upper(), unit, len(abs_errors)))
+                print("    Mean Abs Error: {:.4f}".format(np.mean(abs_errors)))
+                print("    Median Abs Error: {:.4f}".format(np.median(abs_errors)))
+                print("    P90 Abs Error: {:.4f}".format(np.percentile(abs_errors, 90)))
+                print("    P95 Abs Error: {:.4f}".format(np.percentile(abs_errors, 95)))
+            else:
+                print("  {}: No data available".format(metric.upper()))
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate RouteNet TF2 Model')
-    parser.add_argument('--model_dir', type=str, required=True,
-                       help='Directory containing the trained model weights')
-    parser.add_argument('--test_dir', type=str, required=True,
-                       help='Directory containing test TFRecord files')
+    parser = argparse.ArgumentParser(description='Comprehensive RouteNet Evaluation')
+    parser.add_argument('--delay_model_dir', type=str, required=True,
+                      help='Directory containing delay prediction model')
+    parser.add_argument('--drops_model_dir', type=str, required=True,
+                      help='Directory containing drops prediction model')
+    parser.add_argument('--nsfnet_test_dir', type=str, required=True,
+                      help='Directory containing NSFNet test data')
+    parser.add_argument('--gbn_test_dir', type=str, required=True,
+                      help='Directory containing GBN test data')
+    parser.add_argument('--output_dir', type=str, required=True,
+                      help='Directory to save evaluation results')
     parser.add_argument('--batch_size', type=int, default=32,
-                       help='Batch size for evaluation')
+                      help='Batch size for evaluation')
     parser.add_argument('--num_samples', type=int, default=None,
-                       help='Number of samples to evaluate (None for all)')
-    parser.add_argument('--output_dir', type=str, default='evaluation_results',
-                       help='Directory to save evaluation results')
+                      help='Limit number of samples to evaluate')
     
     args = parser.parse_args()
     
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 模型配置（需要与训练时保持一致）
+    # 模型配置（与训练时保持一致）
     config = {
         'link_state_dim': 4,
         'path_state_dim': 2,
@@ -269,50 +427,86 @@ def main():
         'l2_2': 0.01,
     }
     
-    # 创建模型并加载权重
-    model = RouteNet(config, output_units=2)
-    weight_path = os.path.join(args.model_dir, "best_model.weights.h5")
+    print("Starting comprehensive RouteNet evaluation...")
+    print("Delay model dir: {}".format(args.delay_model_dir))
+    print("Drops model dir: {}".format(args.drops_model_dir))
+    print("NSFNet test dir: {}".format(args.nsfnet_test_dir))
+    print("GBN test dir: {}".format(args.gbn_test_dir))
     
-    print(f"Loading model weights from: {weight_path}")
+    # 加载模型
+    delay_model, delay_weight_path = load_model(args.delay_model_dir, 'delay', config)
+    drops_model, drops_weight_path = load_model(args.drops_model_dir, 'drops', config)
     
-    # 创建测试数据集
-    test_files = tf.io.gfile.glob(os.path.join(args.test_dir, '*.tfrecords'))
-    test_dataset = create_dataset(test_files, args.batch_size, is_training=False)
+    # 创建数据集
+    nsfnet_files = tf.io.gfile.glob(os.path.join(args.nsfnet_test_dir, '*.tfrecords'))
+    gbn_files = tf.io.gfile.glob(os.path.join(args.gbn_test_dir, '*.tfrecords'))
     
-    print(f"Found {len(test_files)} test files.")
+    nsfnet_dataset = create_dataset(nsfnet_files, args.batch_size, is_training=False)
+    gbn_dataset = create_dataset(gbn_files, args.batch_size, is_training=False)
     
-    # 需要先运行一次前向传播来初始化权重
-    for features, labels in test_dataset.take(1):
-        _ = model(features, training=False)
-        break
+    print("Found {} NSFNet test files".format(len(nsfnet_files)))
+    print("Found {} GBN test files".format(len(gbn_files)))
+    
+    # 初始化模型权重（需要先运行一次前向传播）
+    print("\nInitializing models...")
+    for dataset in [nsfnet_dataset.take(1)]:
+        for features, labels in dataset:
+            _ = delay_model(features, training=False)
+            _ = drops_model(features, training=False)
+            break
     
     # 加载权重
-    try:
-        model.load_weights(weight_path)
-        print("Model weights loaded successfully!")
-    except Exception as e:
-        print(f"Error loading weights: {e}")
-        return
+    delay_model.load_weights(delay_weight_path)
+    drops_model.load_weights(drops_weight_path)
+    print("Models loaded successfully!")
     
-    # 评估模型
-    print("\nEvaluating model...")
-    predictions, ground_truth, relative_errors = evaluate_model(
-        model, test_dataset, args.num_samples
+    # 评估NSFNet（同拓扑）
+    print("\n" + "="*50)
+    print("EVALUATING NSFNET (SAME TOPOLOGY)")
+    print("="*50)
+    
+    # 评估delay和jitter
+    _, _, nsfnet_delay_jitter_errors = evaluate_delay_jitter_model(
+        delay_model, nsfnet_dataset, args.num_samples
     )
     
+    # 重新创建dataset用于drops评估
+    nsfnet_dataset_drops = create_dataset(nsfnet_files, args.batch_size, is_training=False)
+    _, _, nsfnet_drops_errors = evaluate_drops_model(
+        drops_model, nsfnet_dataset_drops, args.num_samples
+    )
+    
+    # 合并NSFNet结果
+    nsfnet_errors = {**nsfnet_delay_jitter_errors, **nsfnet_drops_errors}
+    
+    # 评估GBN（跨拓扑）
+    print("\n" + "="*50)
+    print("EVALUATING GBN (DIFFERENT TOPOLOGY)")
+    print("="*50)
+    
+    # 评估delay和jitter
+    _, _, gbn_delay_jitter_errors = evaluate_delay_jitter_model(
+        delay_model, gbn_dataset, args.num_samples
+    )
+    
+    # 重新创建dataset用于drops评估
+    gbn_dataset_drops = create_dataset(gbn_files, args.batch_size, is_training=False)
+    _, _, gbn_drops_errors = evaluate_drops_model(
+        drops_model, gbn_dataset_drops, args.num_samples
+    )
+    
+    # 合并GBN结果
+    gbn_errors = {**gbn_delay_jitter_errors, **gbn_drops_errors}
+    
     # 打印评估摘要
-    print_metrics_summary(predictions, ground_truth, relative_errors)
+    print_evaluation_summary(nsfnet_errors, gbn_errors)
     
-    # 绘制CDF对比图
-    print("\nGenerating CDF comparison plot...")
-    cdf_path = os.path.join(args.output_dir, 'relative_error_cdf.png')
-    plot_cdf_comparison(relative_errors, cdf_path)
+    # 绘制综合CDF图
+    print("\nGenerating comprehensive CDF plot...")
+    cdf_path = os.path.join(args.output_dir, 'comprehensive_relative_error_cdf.png')
+    plot_comprehensive_cdf(nsfnet_errors, gbn_errors, cdf_path)
     
-    # 绘制详细分析图
-    print("\nGenerating detailed analysis plots...")
-    plot_detailed_analysis(predictions, ground_truth, relative_errors, args.output_dir)
-    
-    print(f"\nEvaluation completed! Results saved to: {args.output_dir}")
+    print("\nEvaluation completed! Results saved to: {}".format(args.output_dir))
 
 if __name__ == '__main__':
     main()

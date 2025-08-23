@@ -75,10 +75,7 @@ Use `evaluate_routenet.py` to load trained models and generate comprehensive ana
 
 ```bash
 # Basic evaluation
-python evaluate_routenet.py \
-    --model_dir models/routenet_tf2_model \
-    --test_dir data/routenet/nsfnetbw/tfrecords/evaluate \
-    --output_dir evaluation_results
+python evaluate_routenet.py --delay_model_dir models/routenet_tf2_model/nsfnetbw_delay --drops_model_dir models/routenet_tf2_model/nsfnetbw_drops --nsfnet_test_dir data/routenet/nsfnetbw/tfrecords/evaluate --gbn_test_dir data/routenet/gbnbw/tfrecords/evaluate --output_dir evaluation_results --num_samples 1000
 
 # Quick evaluation with limited samples
 python evaluate_routenet.py \
