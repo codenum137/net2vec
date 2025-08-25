@@ -199,9 +199,17 @@ class RouteNet(tf.keras.Model):
 # ==============================================================================
 
 def heteroscedastic_loss(y_true, y_pred):
-    """异方差损失函数 - 用于延迟预测"""
+    """异方差损失函数 - 用于延迟预测
+    
+    这个实现与原始routenet.py中的实现保持一致：
+    - 使用相同的scale计算方式（包含c偏移常数）
+    - 使用相同的_2sigma计算方式
+    """
     loc = y_pred[:, 0]
-    scale = tf.nn.softplus(y_pred[:, 1]) + 1e-9
+    
+    # 与原版保持一致的scale计算，包含重要的c偏移常数
+    c = tf.math.log(tf.math.expm1(tf.constant(0.098, dtype=tf.float32)))
+    scale = tf.nn.softplus(c + y_pred[:, 1]) + 1e-9
     
     delay_true = y_true['delay']
     jitter_true = y_true['jitter']
@@ -209,7 +217,8 @@ def heteroscedastic_loss(y_true, y_pred):
     drops_true = y_true['drops']
     
     n = packets_true - drops_true
-    _2sigma = 2.0 * tf.square(scale)
+    # 与原版保持一致的_2sigma计算
+    _2sigma = tf.constant(2.0, dtype=tf.float32) * tf.square(scale)
     
     nll = (n * jitter_true / _2sigma + 
            n * tf.square(delay_true - loc) / _2sigma + 
@@ -218,26 +227,32 @@ def heteroscedastic_loss(y_true, y_pred):
     return tf.reduce_sum(nll) / 1e6
 
 def binomial_loss(y_true, y_pred):
-    """二项分布损失函数 - 用于丢包预测"""
+    """二项分布损失函数 - 用于丢包预测
+    
+    这个实现与原始routenet.py中的实现保持一致：
+    - 使用 sigmoid_cross_entropy_with_logits 来计算交叉熵
+    - 使用 packets 作为权重
+    - 使用相同的缩放因子 1e5
+    """
     # y_pred 是 logits（未经过 sigmoid）
     logits = y_pred[:, 0]
     
     packets_true = y_true['packets']
     drops_true = y_true['drops']
     
-    # 计算真实丢包率
+    # 计算真实丢包率 (这是标签)
     loss_ratio = drops_true / (packets_true + 1e-9)
     
-    # 使用二项分布负对数似然
-    # 这里使用与原版相同的公式
-    predictions = tf.nn.sigmoid(logits)
+    # 使用与原版相同的公式：
+    # tf.reduce_sum(packets * sigmoid_cross_entropy_with_logits(labels=loss_ratio, logits=logits)) / 1e5
+    loss = tf.reduce_sum(
+        packets_true * tf.nn.sigmoid_cross_entropy_with_logits(
+            labels=loss_ratio,
+            logits=logits
+        )
+    ) / 1e5  # 使用与原版相同的缩放因子
     
-    # 二项分布损失：-sum(log(p^k * (1-p)^(n-k)))
-    # 简化为: -sum(k*log(p) + (n-k)*log(1-p))
-    loss = -(drops_true * tf.math.log(predictions + 1e-9) + 
-             (packets_true - drops_true) * tf.math.log(1 - predictions + 1e-9))
-    
-    return tf.reduce_sum(loss) / 1e6
+    return loss
 
 def create_model_and_loss_fn(config, target):
     """根据target参数创建相应的模型和损失函数"""

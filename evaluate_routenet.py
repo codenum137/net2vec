@@ -80,11 +80,14 @@ def evaluate_delay_jitter_model(model, dataset, num_samples=None):
         # 模型预测 - 异方差输出：[loc, scale]
         pred = model(features, training=False)
         
-        pred_delay = pred[:, 0].numpy()  # 延迟预测均值
-        pred_scale = tf.nn.softplus(pred[:, 1]).numpy()  # 预测的标准差
+        pred_delay = pred[:, 0].numpy()  # 延迟预测均值 (loc)
         
-        # 根据异方差模型，抖动可以近似为标准差
-        pred_jitter = pred_scale
+        # 与原版保持一致的scale计算，包含c偏移常数
+        c = np.log(np.expm1(np.float32(0.098)))
+        pred_scale = tf.nn.softplus(c + pred[:, 1]).numpy() + 1e-9
+        
+        # 根据原版的实现：jitter_prediction = scale**2
+        pred_jitter = pred_scale ** 2
         
         # 收集真实值
         true_delay = labels['delay'].numpy()

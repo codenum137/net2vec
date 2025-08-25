@@ -27,14 +27,7 @@ pip install tensorflow tqdm numpy matplotlib seaborn
 Use `routenet_tf2.py` to train the RouteNet model with modern TensorFlow 2.x:
 
 ```bash
-python routenet/routenet_tf2.py \
-    --train_dir data/routenet/nsfnetbw/tfrecords/train/ \
-    --eval_dir data/routenet/nsfnetbw/tfrecords/evaluate/ \
-    --model_dir models/routenet_tf2_model \
-    --target delay \
-    --epochs 20 \
-    --batch_size 32 \
-    --learning_rate 0.001
+python routenet/routenet_tf2.py     --train_dir data/routenet/nsfnetbw/tfrecords/train/     --eval_dir data/routenet/nsfnetbw/tfrecords/evaluate/     --model_dir models/routenet_tf2_model     --target drops     --epochs 20     --batch_size 32  --lr_schedule plateau   --learning_rate 0.001 --plateau_patience 5 --plateau_factor 0.5
 ```
 
 **Training Parameters:**
