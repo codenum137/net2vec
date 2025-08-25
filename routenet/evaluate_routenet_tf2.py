@@ -176,139 +176,26 @@ def evaluate_drops_model(model, dataset, num_samples=None):
     
     return predictions, ground_truth, relative_errors
 
-def plot_comprehensive_cdf(nsfnet_errors, gbn_errors, output_path):
+
+def plot_linear_focus_cdf(nsfnet_errors, gbn_errors, output_dir):
     """
-    绘制综合的相对误差CDF图，包含三种指标和两种拓扑
+    绘制线性刻度的相对误差CDF图，显示正负误差分布
     
     Args:
         nsfnet_errors: nsfnet拓扑的相对误差
         gbn_errors: gbn拓扑的相对误差  
-        output_path: 保存路径
+        output_dir: 保存目录
     """
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
-    
     # 设置颜色和线型
     colors = {'delay': '#1f77b4', 'jitter': '#ff7f0e', 'drops': '#2ca02c'}
     linestyles = {'nsfnet': '-', 'gbn': '--'}
     
-    # 收集所有误差数据以确定合适的范围
-    all_errors = []
-    for errors_dict in [nsfnet_errors, gbn_errors]:
-        for metric in ['delay', 'jitter', 'drops']:
-            if metric in errors_dict and len(errors_dict[metric]) > 0:
-                all_errors.extend(np.abs(errors_dict[metric]))
-    
-    # 左图：对数刻度，显示完整范围
-    ax = ax1
-    for metric in ['delay', 'jitter', 'drops']:
-        if metric in nsfnet_errors and len(nsfnet_errors[metric]) > 0:
-            sorted_errors = np.sort(np.abs(nsfnet_errors[metric]))
-            cdf_values = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
-            ax.plot(sorted_errors, cdf_values, 
-                    color=colors[metric], linestyle=linestyles['nsfnet'],
-                    linewidth=2.5, label='NSFNet {}'.format(metric.upper()))
-        
-        if metric in gbn_errors and len(gbn_errors[metric]) > 0:
-            sorted_errors = np.sort(np.abs(gbn_errors[metric]))
-            cdf_values = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
-            ax.plot(sorted_errors, cdf_values,
-                    color=colors[metric], linestyle=linestyles['gbn'],
-                    linewidth=2.5, label='GBN {}'.format(metric.upper()))
-    
-    # 添加理想情况的参考线（垂直线在x=0处）
-    ax.axvline(x=0, color='red', linestyle=':', linewidth=2, alpha=0.7, label='Ideal (Zero Error)')
-    
-    ax.set_xlabel('Relative Error (Absolute Value)', fontsize=12)
-    ax.set_ylabel('CDF', fontsize=12)
-    ax.set_title('Relative Error CDF - Log Scale\n(Closer to red line is better)', fontsize=14)
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc='lower right', fontsize=10)
-    
-    if all_errors:
-        min_error = np.min(all_errors)
-        max_error = np.max(all_errors)
-        ax.set_xscale('log')
-        x_min = max(min_error * 0.1, 1e-8)
-        x_max = max_error * 2
-        ax.set_xlim(x_min, x_max)
-    else:
-        ax.set_xlim(1e-6, 10)
-    ax.set_ylim(0, 1)
-    
-    # 右图：线性刻度，聚焦于小误差区域
-    ax = ax2
-    for metric in ['delay', 'jitter', 'drops']:
-        if metric in nsfnet_errors and len(nsfnet_errors[metric]) > 0:
-            sorted_errors = np.sort(np.abs(nsfnet_errors[metric]))
-            cdf_values = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
-            ax.plot(sorted_errors, cdf_values, 
-                    color=colors[metric], linestyle=linestyles['nsfnet'],
-                    linewidth=2.5, label='NSFNet {}'.format(metric.upper()))
-        
-        if metric in gbn_errors and len(gbn_errors[metric]) > 0:
-            sorted_errors = np.sort(np.abs(gbn_errors[metric]))
-            cdf_values = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
-            ax.plot(sorted_errors, cdf_values,
-                    color=colors[metric], linestyle=linestyles['gbn'],
-                    linewidth=2.5, label='GBN {}'.format(metric.upper()))
-    
-    # 添加理想情况的参考线
-    ax.axvline(x=0, color='red', linestyle=':', linewidth=2, alpha=0.7, label='Ideal (Zero Error)')
-    
-    ax.set_xlabel('Relative Error (Absolute Value)', fontsize=12)
-    ax.set_ylabel('CDF', fontsize=12)
-    ax.set_title('Relative Error CDF - Linear Scale\n(Focus on small errors)', fontsize=14)
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc='lower right', fontsize=10)
-    
-    # 线性刻度，聚焦于0到合理范围
-    if all_errors:
-        p90_error = np.percentile(all_errors, 90)
-        ax.set_xlim(0, min(p90_error * 1.5, 1.0))
-    else:
-        ax.set_xlim(0, 0.5)
-    ax.set_ylim(0, 1)
-    
-    # 添加统计信息到两个子图
-    stats_text = []
-    for topo in ['nsfnet', 'gbn']:
-        errors = nsfnet_errors if topo == 'nsfnet' else gbn_errors
-        for metric in ['delay', 'jitter', 'drops']:
-            if metric in errors and len(errors[metric]) > 0:
-                median_error = np.median(np.abs(errors[metric]))
-                p90_error = np.percentile(np.abs(errors[metric]), 90)
-                p95_error = np.percentile(np.abs(errors[metric]), 95)
-                stats_text.append('{} {}: Med={:.4f}, P90={:.4f}, P95={:.4f}'.format(
-                    topo.upper(), metric.upper(), median_error, p90_error, p95_error))
-    
-    # 在左图添加统计信息
-    stats_str = '\n'.join(stats_text)
-    ax1.text(0.02, 0.98, stats_str, transform=ax1.transAxes, 
-             fontsize=9, verticalalignment='top', 
-             bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
-    
-    # 添加性能解释文本到右图
-    explanation_text = ("Performance Interpretation:\n" +
-                       "• Ideal: Vertical line at x=0\n" +
-                       "• Better: Curve closer to x=0\n" +
-                       "• Steep rise near 0: High accuracy\n" +
-                       "• Gradual rise: Lower accuracy")
-    ax2.text(0.98, 0.02, explanation_text, transform=ax2.transAxes, 
-             fontsize=9, horizontalalignment='right', verticalalignment='bottom',
-             bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
-    
-    plt.tight_layout()
-    plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    plt.show()
-    print("Comprehensive CDF plot saved to: {}".format(output_path))
-    
-    # 创建单独的线性刻度图，更清楚地显示小误差区域
     plt.figure(figsize=(12, 8))
     
     for metric in ['delay', 'jitter', 'drops']:
         if metric in nsfnet_errors and len(nsfnet_errors[metric]) > 0:
             # 不取绝对值，保留正负信息
-            sorted_errors = np.sort(nsfnet_errors[metric])  # 注意：这里不取abs()
+            sorted_errors = np.sort(nsfnet_errors[metric])
             cdf_values = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
             plt.plot(sorted_errors, cdf_values, 
                     color=colors[metric], linestyle=linestyles['nsfnet'],
@@ -316,7 +203,7 @@ def plot_comprehensive_cdf(nsfnet_errors, gbn_errors, output_path):
         
         if metric in gbn_errors and len(gbn_errors[metric]) > 0:
             # 不取绝对值，保留正负信息
-            sorted_errors = np.sort(gbn_errors[metric])  # 注意：这里不取abs()
+            sorted_errors = np.sort(gbn_errors[metric])
             cdf_values = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
             plt.plot(sorted_errors, cdf_values,
                     color=colors[metric], linestyle=linestyles['gbn'],
@@ -327,7 +214,7 @@ def plot_comprehensive_cdf(nsfnet_errors, gbn_errors, output_path):
     
     plt.xlabel('Relative Error (Positive: Over-prediction, Negative: Under-prediction)', fontsize=14)
     plt.ylabel('CDF', fontsize=14)
-    plt.title('Relative Error CDF - Linear Scale with Positive/Negative Errors\n(Ideal is Vertical Red Line at 0)', fontsize=16)
+    plt.title('Relative Error CDF - Linear Scale with Positive/Negative Errors\\n(Ideal is Vertical Red Line at 0)', fontsize=16)
     plt.grid(True, alpha=0.3)
     plt.legend(loc='center right', fontsize=12)
     
@@ -336,7 +223,7 @@ def plot_comprehensive_cdf(nsfnet_errors, gbn_errors, output_path):
     for errors_dict in [nsfnet_errors, gbn_errors]:
         for metric in ['delay', 'jitter', 'drops']:
             if metric in errors_dict and len(errors_dict[metric]) > 0:
-                all_signed_errors.extend(errors_dict[metric])  # 不取绝对值
+                all_signed_errors.extend(errors_dict[metric])
     
     if all_signed_errors:
         min_error = np.min(all_signed_errors)
@@ -350,7 +237,7 @@ def plot_comprehensive_cdf(nsfnet_errors, gbn_errors, output_path):
         plt.xlim(-0.5, 0.5)
     plt.ylim(0, 1)
     
-    # 更新统计信息，包含正负误差的信息
+    # 添加统计信息，包含正负误差的信息
     detailed_stats = []
     for topo in ['nsfnet', 'gbn']:
         errors = nsfnet_errors if topo == 'nsfnet' else gbn_errors
@@ -359,19 +246,19 @@ def plot_comprehensive_cdf(nsfnet_errors, gbn_errors, output_path):
                 mean_error = np.mean(errors[metric])  # 包含符号的平均误差
                 abs_errors = np.abs(errors[metric])
                 median_abs_error = np.median(abs_errors)
-                detailed_stats.append('{} {}: Mean={:.4f}, |Med|={:.4f}'.format(
+                detailed_stats.append('{} {}: Mean={:.4f}, |Med|={:.4f}\n'.format(
                     topo.upper(), metric.upper(), mean_error, median_abs_error))
     
-    detailed_stats_str = '\n'.join(detailed_stats)
+    detailed_stats_str = '\\n'.join(detailed_stats)
     plt.text(0.02, 0.98, detailed_stats_str, transform=plt.gca().transAxes, 
              fontsize=10, verticalalignment='top', 
              bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
     
-    output_path_linear = output_path.replace('.png', '_linear_focus.png')
+    output_path = os.path.join(output_dir, 'relative_error_cdf.png')
     plt.tight_layout()
-    plt.savefig(output_path_linear, dpi=300, bbox_inches='tight')
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.show()
-    print("Linear scale CDF plot with positive/negative errors saved to: {}".format(output_path_linear))
+    print("Linear scale CDF plot with positive/negative errors saved to: {}".format(output_path))
 
 def print_evaluation_summary(nsfnet_errors, gbn_errors):
     """
@@ -504,10 +391,9 @@ def main():
     # 打印评估摘要
     print_evaluation_summary(nsfnet_errors, gbn_errors)
     
-    # 绘制综合CDF图
-    print("\nGenerating comprehensive CDF plot...")
-    cdf_path = os.path.join(args.output_dir, 'comprehensive_relative_error_cdf.png')
-    plot_comprehensive_cdf(nsfnet_errors, gbn_errors, cdf_path)
+    # 绘制线性刻度CDF图（仅生成linear_focus版本）
+    print("\nGenerating linear focus CDF plot...")
+    plot_linear_focus_cdf(nsfnet_errors, gbn_errors, args.output_dir)
     
     print("\nEvaluation completed! Results saved to: {}".format(args.output_dir))
 
