@@ -81,7 +81,10 @@ def load_tf1_model_and_predict(model_dir, test_files, target, num_samples=None):
             try:
                 with tqdm(desc=f"Evaluating {target} model") as pbar:
                     while True:
-                        # 同时获取预测、真实标签和特征
+                        # 同时获取：
+                        # 1. pred_vals: 模型的预测输出
+                        # 2. label_vals: 测试数据集中的真实标签 
+                        # 3. features_vals: 测试数据集中的特征数据
                         pred_vals, label_vals, features_vals = sess.run([predictions_op, labels, features])
                         
                         if target == 'delay':
@@ -102,11 +105,26 @@ def load_tf1_model_and_predict(model_dir, test_files, target, num_samples=None):
                             if 'drops' in pred_vals:
                                 predictions['drops'].extend(pred_vals['drops'])
                             
+                            # 调试信息
+                            if sample_count == 0:
+                                print(f"DEBUG: label_vals keys: {list(label_vals.keys())}")
+                                print(f"DEBUG: features_vals keys: {list(features_vals.keys())}")
+                                print(f"DEBUG: pred_vals keys: {list(pred_vals.keys())}")
+                            
                             # 真实标签 - 计算丢包率
                             # 注意：packets在features中，drops在labels中
                             if 'drops' in label_vals and 'packets' in features_vals:
                                 true_drop_rates = label_vals['drops'] / (features_vals['packets'] + 1e-10)
                                 ground_truth['drops'].extend(true_drop_rates)
+                                if sample_count == 0:
+                                    print(f"DEBUG: Successfully extracted {len(true_drop_rates)} drop rates")
+                            else:
+                                if sample_count == 0:
+                                    print(f"DEBUG: Condition failed - drops in labels: {'drops' in label_vals}, packets in features: {'packets' in features_vals}")
+                                    if 'drops' in label_vals:
+                                        print(f"DEBUG: drops shape: {label_vals['drops'].shape}")
+                                    if 'packets' in features_vals:
+                                        print(f"DEBUG: packets shape: {features_vals['packets'].shape}")
                         
                         batch_size = len(pred_vals.get('delay', pred_vals.get('drops', [0])))
                         sample_count += batch_size
@@ -121,7 +139,9 @@ def load_tf1_model_and_predict(model_dir, test_files, target, num_samples=None):
     # 计算相对误差
     relative_errors = calculate_relative_errors(predictions, ground_truth, target)
     
-    print(f"Extracted {len(ground_truth.get('delay', ground_truth.get('drops', [])))} ground truth labels")
+    # 计算提取的标签总数
+    total_labels = sum(len(ground_truth.get(key, [])) for key in ground_truth.keys())
+    print(f"Extracted {total_labels} ground truth labels")
     
     return predictions, ground_truth, relative_errors
 
