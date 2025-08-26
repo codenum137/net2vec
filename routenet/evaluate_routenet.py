@@ -81,8 +81,8 @@ def load_tf1_model_and_predict(model_dir, test_files, target, num_samples=None):
             try:
                 with tqdm(desc=f"Evaluating {target} model") as pbar:
                     while True:
-                        # 同时获取预测和真实标签
-                        pred_vals, label_vals = sess.run([predictions_op, labels])
+                        # 同时获取预测、真实标签和特征
+                        pred_vals, label_vals, features_vals = sess.run([predictions_op, labels, features])
                         
                         if target == 'delay':
                             # 延迟模型预测
@@ -103,8 +103,9 @@ def load_tf1_model_and_predict(model_dir, test_files, target, num_samples=None):
                                 predictions['drops'].extend(pred_vals['drops'])
                             
                             # 真实标签 - 计算丢包率
-                            if 'drops' in label_vals and 'packets' in label_vals:
-                                true_drop_rates = label_vals['drops'] / (label_vals['packets'] + 1e-10)
+                            # 注意：packets在features中，drops在labels中
+                            if 'drops' in label_vals and 'packets' in features_vals:
+                                true_drop_rates = label_vals['drops'] / (features_vals['packets'] + 1e-10)
                                 ground_truth['drops'].extend(true_drop_rates)
                         
                         batch_size = len(pred_vals.get('delay', pred_vals.get('drops', [0])))
@@ -225,7 +226,7 @@ def plot_linear_focus_cdf(nsfnet_errors, gbn_errors, output_dir):
                 mean_error = np.mean(errors[metric])
                 abs_errors = np.abs(errors[metric])
                 median_abs_error = np.median(abs_errors)
-                detailed_stats.append('{} {}: Mean={:.4f}, |Med|={:.4f}'.format(
+                detailed_stats.append('{} {}: Mean={:.4f}, |Med|={:.4f}\n'.format(
                     topo.upper(), metric.upper(), mean_error, median_abs_error))
     
     detailed_stats_str = '\\n'.join(detailed_stats)
