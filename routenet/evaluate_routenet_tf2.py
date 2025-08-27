@@ -17,7 +17,7 @@ import seaborn as sns
 # 导入训练脚本中的相关函数和类
 import sys
 sys.path.append(os.path.dirname(__file__))
-from routenet.routenet_tf2 import (
+from routenet_tf2 import (
     RouteNet, create_dataset, parse_fn, transformation_func,
     scale_fn, heteroscedastic_loss, binomial_loss, create_model_and_loss_fn
 )
