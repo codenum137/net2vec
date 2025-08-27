@@ -7,6 +7,104 @@ from tqdm import tqdm
 import datetime
 
 # ==============================================================================
+# KAN (Kolmogorov-Arnold Networks) Implementation
+# ==============================================================================
+
+class KANLayer(tf.keras.layers.Layer):
+    """
+    KAN (Kolmogorov-Arnold Networks) Layer implementation
+    简化版本，使用可学习的样条函数替代传统激活函数
+    """
+    
+    def __init__(self, units, grid_size=5, spline_order=3, **kwargs):
+        super(KANLayer, self).__init__(**kwargs)
+        self.units = units
+        self.grid_size = grid_size
+        self.spline_order = spline_order
+        
+    def build(self, input_shape):
+        input_dim = int(input_shape[-1])
+        
+        # 基础权重矩阵（线性部分）
+        self.base_weight = self.add_weight(
+            name='base_weight',
+            shape=(input_dim, self.units),
+            initializer='glorot_uniform',
+            trainable=True
+        )
+        
+        # 偏置项
+        self.bias = self.add_weight(
+            name='bias',
+            shape=(self.units,),
+            initializer='zeros',
+            trainable=True
+        )
+        
+        # 样条函数的权重参数
+        # 为每个输入-输出连接学习多项式系数
+        self.spline_weights = self.add_weight(
+            name='spline_weights',
+            shape=(input_dim, self.units, 4),  # 3次多项式，4个系数
+            initializer='glorot_uniform',
+            trainable=True
+        )
+        
+        # 门控参数：控制线性部分和非线性部分的权重
+        self.gate_weights = self.add_weight(
+            name='gate_weights',
+            shape=(input_dim, self.units),
+            initializer='ones',
+            trainable=True
+        )
+        
+        super(KANLayer, self).build(input_shape)
+    
+    def call(self, inputs, training=None):
+        # 基础线性变换
+        linear_output = tf.matmul(inputs, self.base_weight) + self.bias  # [batch_size, units]
+        
+        # 非线性样条变换
+        # 将输入标准化到[-1, 1]范围
+        x_normalized = tf.tanh(inputs)  # [batch_size, input_dim]
+        
+        # 计算多项式基函数：1, x, x^2, x^3
+        x_powers = tf.stack([
+            tf.ones_like(x_normalized),
+            x_normalized,
+            tf.square(x_normalized),
+            tf.pow(x_normalized, 3)
+        ], axis=-1)  # [batch_size, input_dim, 4]
+        
+        # 样条输出计算：[batch_size, input_dim, 4] @ [input_dim, units, 4] -> [batch_size, input_dim, units]
+        # 使用 einsum 进行高效的张量乘法
+        spline_contributions = tf.einsum('bid,ijd->bij', x_powers, self.spline_weights)  # [batch_size, input_dim, units]
+        
+        # 应用门控权重并求和
+        gated_splines = spline_contributions * tf.expand_dims(self.gate_weights, 0)  # [batch_size, input_dim, units]
+        spline_output = tf.reduce_sum(gated_splines, axis=1)  # [batch_size, units]
+        
+        # 组合线性和非线性部分
+        output = linear_output + spline_output
+        
+        # 应用激活函数
+        output = tf.nn.selu(output)
+        
+        return output
+    
+    def compute_output_shape(self, input_shape):
+        return (input_shape[0], self.units)
+    
+    def get_config(self):
+        config = super(KANLayer, self).get_config()
+        config.update({
+            'units': self.units,
+            'grid_size': self.grid_size,
+            'spline_order': self.spline_order,
+        })
+        return config
+
+# ==============================================================================
 # 1. 数据加载与预处理 (无变化)
 # ==============================================================================
 
@@ -130,22 +228,35 @@ def create_dataset(filenames, batch_size, is_training=True):
 # ==============================================================================
 
 class RouteNet(tf.keras.Model):
-    def __init__(self, config, output_units=2, final_activation=None):
+    def __init__(self, config, output_units=2, final_activation=None, use_kan=False):
         super().__init__()
         self.config = config
+        self.use_kan = use_kan
         
         # 消息传递层
         self.path_update = tf.keras.layers.GRUCell(config['path_state_dim'])
         self.link_update = tf.keras.layers.GRUCell(config['link_state_dim'])
 
-        # 读出网络
-        self.readout = tf.keras.Sequential([
-            tf.keras.layers.Dense(
-                config['readout_units'],
-                activation='selu',
-                kernel_regularizer=tf.keras.regularizers.l2(config['l2'])
-            ) for _ in range(config['readout_layers'])
-        ])
+        # 读出网络 - 根据use_kan参数选择MLP或KAN
+        if use_kan:
+            print("Using KAN (Kolmogorov-Arnold Networks) for readout layers")
+            self.readout = tf.keras.Sequential([
+                KANLayer(
+                    config['readout_units'],
+                    grid_size=5,
+                    spline_order=3,
+                    name='kan_layer_{}'.format(i)
+                ) for i in range(config['readout_layers'])
+            ])
+        else:
+            print("Using traditional MLP for readout layers")
+            self.readout = tf.keras.Sequential([
+                tf.keras.layers.Dense(
+                    config['readout_units'],
+                    activation='selu',
+                    kernel_regularizer=tf.keras.regularizers.l2(config['l2'])
+                ) for _ in range(config['readout_layers'])
+            ])
         
         # 最终输出层，支持不同的激活函数
         self.final_layer = tf.keras.layers.Dense(
@@ -254,18 +365,20 @@ def binomial_loss(y_true, y_pred):
     
     return loss
 
-def create_model_and_loss_fn(config, target):
+def create_model_and_loss_fn(config, target, use_kan=False):
     """根据target参数创建相应的模型和损失函数"""
     if target == 'delay':
         # 延迟预测模型
-        model = RouteNet(config, output_units=2, final_activation=None)
+        model = RouteNet(config, output_units=2, final_activation=None, use_kan=use_kan)
         loss_fn = heteroscedastic_loss
-        print("Created delay prediction model with heteroscedastic loss")
+        model_type = "KAN-based" if use_kan else "MLP-based"
+        print("Created {} delay prediction model with heteroscedastic loss".format(model_type))
     elif target == 'drops':
         # 丢包预测模型
-        model = RouteNet(config, output_units=1, final_activation=None)
+        model = RouteNet(config, output_units=1, final_activation=None, use_kan=use_kan)
         loss_fn = binomial_loss
-        print("Created drop prediction model with binomial loss")
+        model_type = "KAN-based" if use_kan else "MLP-based"
+        print("Created {} drop prediction model with binomial loss".format(model_type))
     else:
         raise ValueError("Unsupported target: {}. Choose 'delay' or 'drops'".format(target))
     
@@ -304,9 +417,10 @@ def main(args):
         'l2_2': 0.01,
     }
 
-    # 设置 TensorBoard 日志目录，包含target信息
+    # 设置 TensorBoard 日志目录，包含target和KAN信息
     current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    log_dir = os.path.join(args.model_dir, 'logs', '{}_{}'.format(args.target, current_time))
+    model_type = "kan" if args.kan else "mlp"
+    log_dir = os.path.join(args.model_dir, 'logs', '{}_{}_{}'.format(args.target, model_type, current_time))
     train_log_dir = os.path.join(log_dir, 'train')
     val_log_dir = os.path.join(log_dir, 'validation')
     
@@ -323,7 +437,7 @@ def main(args):
     print("Found {} evaluation files.".format(len(eval_files)))
 
     # 根据target创建模型和损失函数
-    model, loss_fn = create_model_and_loss_fn(config, args.target)
+    model, loss_fn = create_model_and_loss_fn(config, args.target, use_kan=args.kan)
     
     # 创建动态学习率调度器
     if args.lr_schedule == 'exponential':
@@ -460,7 +574,10 @@ def main(args):
             print("Evaluation loss improved from {:.4f} to {:.4f}. Saving model...".format(
                 best_eval_loss, avg_eval_loss))
             best_eval_loss = avg_eval_loss
-            save_path = os.path.join(args.model_dir, "best_{}_model.weights.h5".format(args.target))
+            
+            # 根据是否使用KAN来命名模型文件
+            model_suffix = "kan_model" if args.kan else "model"
+            save_path = os.path.join(args.model_dir, "best_{}_{}.weights.h5".format(args.target, model_suffix))
             model.save_weights(save_path)
             
             # 记录最佳模型的信息
@@ -474,8 +591,11 @@ def main(args):
     val_summary_writer.close()
     print("\nTraining completed! TensorBoard logs saved to: {}".format(log_dir))
     print("To view the results, run: tensorboard --logdir {}".format(log_dir))
+    
+    # 根据是否使用KAN来显示模型文件名
+    model_suffix = "kan_model" if args.kan else "model"
     print("Model weights saved as: {}".format(
-        os.path.join(args.model_dir, "best_{}_model.weights.h5".format(args.target))))
+        os.path.join(args.model_dir, "best_{}_{}.weights.h5".format(args.target, model_suffix))))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='RouteNet TF2 Implementation')
@@ -487,6 +607,8 @@ if __name__ == '__main__':
                       help='Directory to save model checkpoints and logs')
     parser.add_argument('--target', type=str, choices=['delay', 'drops'], default='delay',
                       help='Training target: "delay" for delay prediction, "drops" for packet drop prediction')
+    parser.add_argument('--kan', action='store_true', 
+                      help='Use KAN (Kolmogorov-Arnold Networks) instead of traditional MLP for readout layers')
     parser.add_argument('--epochs', type=int, default=10,
                       help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=32,
