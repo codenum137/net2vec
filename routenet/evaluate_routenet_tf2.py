@@ -22,7 +22,7 @@ from routenet_tf2 import (
     scale_fn, heteroscedastic_loss, binomial_loss, create_model_and_loss_fn
 )
 
-def load_model(model_dir, target, config):
+def load_model(model_dir, target, config, use_kan=False):
     """
     加载指定目标的模型
     
@@ -30,19 +30,29 @@ def load_model(model_dir, target, config):
         model_dir: 模型目录路径
         target: 'delay' 或 'drops'
         config: 模型配置
+        use_kan: 是否使用KAN模型
     
     Returns:
         model: 加载了权重的模型
     """
-    # 根据target创建相应的模型
-    model, _ = create_model_and_loss_fn(config, target)
+    # 根据target和use_kan参数创建相应的模型
+    model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
     
-    # 寻找权重文件
-    weight_files = [
-        os.path.join(model_dir, "best_{}_model.weights.h5".format(target)),
-        os.path.join(model_dir, "best_model.weights.h5"),
-        os.path.join(model_dir, "model.weights.h5")
-    ]
+    # 寻找权重文件，优先寻找KAN或MLP特定的文件
+    if use_kan:
+        weight_files = [
+            os.path.join(model_dir, "best_{}_kan_model.weights.h5".format(target)),
+            os.path.join(model_dir, "best_kan_model.weights.h5"),
+            os.path.join(model_dir, "best_{}_model.weights.h5".format(target)),
+            os.path.join(model_dir, "best_model.weights.h5"),
+            os.path.join(model_dir, "model.weights.h5")
+        ]
+    else:
+        weight_files = [
+            os.path.join(model_dir, "best_{}_model.weights.h5".format(target)),
+            os.path.join(model_dir, "best_model.weights.h5"),
+            os.path.join(model_dir, "model.weights.h5")
+        ]
     
     weight_path = None
     for path in weight_files:
@@ -53,7 +63,8 @@ def load_model(model_dir, target, config):
     if weight_path is None:
         raise FileNotFoundError("No model weights found in {}".format(model_dir))
     
-    print("Loading {} model weights from: {}".format(target, weight_path))
+    model_type = "KAN" if use_kan else "MLP"
+    print("Loading {} {} model weights from: {}".format(model_type, target, weight_path))
     
     return model, weight_path
 
@@ -177,7 +188,7 @@ def evaluate_drops_model(model, dataset, num_samples=None):
     return predictions, ground_truth, relative_errors
 
 
-def plot_linear_focus_cdf(nsfnet_errors, gbn_errors, output_dir):
+def plot_linear_focus_cdf(nsfnet_errors, gbn_errors, output_dir, model_suffix=""):
     """
     绘制线性刻度的相对误差CDF图，显示正负误差分布
     
@@ -185,6 +196,7 @@ def plot_linear_focus_cdf(nsfnet_errors, gbn_errors, output_dir):
         nsfnet_errors: nsfnet拓扑的相对误差
         gbn_errors: gbn拓扑的相对误差  
         output_dir: 保存目录
+        model_suffix: 模型后缀（如"_kan"用于区分不同模型类型）
     """
     # 设置颜色和线型
     colors = {'delay': '#1f77b4', 'jitter': '#ff7f0e', 'drops': '#2ca02c'}
@@ -212,9 +224,13 @@ def plot_linear_focus_cdf(nsfnet_errors, gbn_errors, output_dir):
     # 添加理想情况的参考线
     plt.axvline(x=0, color='red', linestyle=':', linewidth=3, alpha=0.8, label='Ideal (Zero Error)')
     
+    # 根据模型类型调整标题
+    model_type = "KAN" if "kan" in model_suffix.lower() else "MLP"
+    title = 'Relative Error CDF - {} Model - Linear Scale with Positive/Negative Errors\\n(Ideal is Vertical Red Line at 0)'.format(model_type)
+    
     plt.xlabel('Relative Error (Positive: Over-prediction, Negative: Under-prediction)', fontsize=14)
     plt.ylabel('CDF', fontsize=14)
-    plt.title('Relative Error CDF - Linear Scale with Positive/Negative Errors\\n(Ideal is Vertical Red Line at 0)', fontsize=16)
+    plt.title(title, fontsize=16)
     plt.grid(True, alpha=0.3)
     plt.legend(loc='center right', fontsize=12)
     
@@ -254,7 +270,9 @@ def plot_linear_focus_cdf(nsfnet_errors, gbn_errors, output_dir):
              fontsize=10, verticalalignment='top', 
              bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
     
-    output_path = os.path.join(output_dir, 'relative_error_cdf.png')
+    # 根据模型类型调整文件名
+    filename = 'relative_error_cdf{}.png'.format(model_suffix)
+    output_path = os.path.join(output_dir, filename)
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.show()
@@ -300,6 +318,8 @@ def main():
                       help='Batch size for evaluation')
     parser.add_argument('--num_samples', type=int, default=None,
                       help='Limit number of samples to evaluate')
+    parser.add_argument('--kan', action='store_true',
+                      help='Evaluate KAN-based models instead of traditional MLP models')
     
     args = parser.parse_args()
     
@@ -317,15 +337,16 @@ def main():
         'l2_2': 0.01,
     }
     
-    print("Starting comprehensive RouteNet evaluation...")
+    model_type = "KAN" if args.kan else "MLP"
+    print("Starting comprehensive RouteNet evaluation with {} models...".format(model_type))
     print("Delay model dir: {}".format(args.delay_model_dir))
     print("Drops model dir: {}".format(args.drops_model_dir))
     print("NSFNet test dir: {}".format(args.nsfnet_test_dir))
     print("GBN test dir: {}".format(args.gbn_test_dir))
     
     # 加载模型
-    delay_model, delay_weight_path = load_model(args.delay_model_dir, 'delay', config)
-    drops_model, drops_weight_path = load_model(args.drops_model_dir, 'drops', config)
+    delay_model, delay_weight_path = load_model(args.delay_model_dir, 'delay', config, use_kan=args.kan)
+    drops_model, drops_weight_path = load_model(args.drops_model_dir, 'drops', config, use_kan=args.kan)
     
     # 创建数据集
     nsfnet_files = tf.io.gfile.glob(os.path.join(args.nsfnet_test_dir, '*.tfrecords'))
@@ -393,7 +414,8 @@ def main():
     
     # 绘制线性刻度CDF图（仅生成linear_focus版本）
     print("\nGenerating linear focus CDF plot...")
-    plot_linear_focus_cdf(nsfnet_errors, gbn_errors, args.output_dir)
+    model_suffix = "_kan" if args.kan else "_mlp"
+    plot_linear_focus_cdf(nsfnet_errors, gbn_errors, args.output_dir, model_suffix)
     
     print("\nEvaluation completed! Results saved to: {}".format(args.output_dir))
 
