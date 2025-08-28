@@ -233,9 +233,9 @@ class RouteNet(tf.keras.Model):
         self.config = config
         self.use_kan = use_kan
         
-        # 消息传递层
+        # 消息传递层（与原版保持一致的命名）
+        self.link_update = tf.keras.layers.GRUCell(config['link_state_dim'])  # 原版中叫 edge_update
         self.path_update = tf.keras.layers.GRUCell(config['path_state_dim'])
-        self.link_update = tf.keras.layers.GRUCell(config['link_state_dim'])
 
         # 读出网络 - 根据use_kan参数选择MLP或KAN
         if use_kan:
@@ -277,28 +277,60 @@ class RouteNet(tf.keras.Model):
             tf.zeros([inputs['n_paths'], self.config['path_state_dim'] - 1])
         ], axis=1)
 
-        # T 轮消息传递
-        for t in range(self.config['T']):
-            # 路径更新：收集每条路径经过的链路状态
-            link_gather = tf.gather(link_state, inputs['links'])
+        links = inputs['links']
+        paths = inputs['paths']
+        seqs = inputs['sequences']
+        
+        # T 轮消息传递（使用与原版相同的 RNN 处理）
+        for _ in range(self.config['T']):
+            # 收集每条边上的链路状态
+            h_ = tf.gather(link_state, links)
             
-            # 简化的路径更新 - 使用 segment_sum 来聚合每条路径的链路状态
-            # 而不是使用复杂的序列处理
-            path_link_agg = tf.math.unsorted_segment_sum(
-                link_gather, inputs['paths'], inputs['n_paths']
+            # 构建路径的序列输入 - 与原版完全一致
+            ids = tf.stack([paths, seqs], axis=1)
+            max_len = tf.reduce_max(seqs) + 1
+            shape = tf.stack([inputs['n_paths'], max_len, self.config['link_state_dim']])
+            
+            # 计算每条路径的长度
+            # 注意：segment_sum 要求 segment_ids 是排序的
+            unique_paths, _ = tf.unique(paths)
+            lens = tf.math.unsorted_segment_sum(
+                data=tf.ones_like(paths, dtype=tf.int32),
+                segment_ids=paths, 
+                num_segments=inputs['n_paths']
             )
             
-            # 使用 GRU 更新路径状态
-            path_state, _ = self.path_update(path_link_agg, [path_state])
+            # 将链路状态散布到序列格式 [n_paths, max_len, link_state_dim]
+            link_inputs = tf.scatter_nd(ids, h_, shape)
             
-            # 链路更新：聚合所有经过每条链路的路径信息
-            path_messages = tf.gather(path_state, inputs['paths'])
-            link_agg_messages = tf.math.unsorted_segment_sum(
-                path_messages, inputs['links'], inputs['n_links']
+            # 使用 masking 来处理变长序列
+            # 创建 mask: True 表示有效位置，False 表示 padding
+            mask = tf.sequence_mask(lens, maxlen=max_len, dtype=tf.bool)
+            
+            # 使用 Keras RNN 而不是已弃用的 dynamic_rnn
+            # 创建 RNN 层
+            rnn_layer = tf.keras.layers.RNN(
+                self.path_update, 
+                return_sequences=True, 
+                return_state=True
             )
+            
+            # RNN 前向传播
+            outputs, path_state = rnn_layer(
+                link_inputs, 
+                initial_state=path_state, 
+                mask=mask,
+                training=training
+            )
+            
+            # 从 RNN 输出中提取对应路径位置的结果
+            m = tf.gather_nd(outputs, ids)
+            
+            # 按链路聚合所有路径的消息
+            m = tf.math.unsorted_segment_sum(m, links, inputs['n_links'])
             
             # 更新链路状态
-            link_state, _ = self.link_update(link_agg_messages, [link_state])
+            link_state, _ = self.link_update(m, [link_state])
 
         # 读出阶段
         readout_output = self.readout(path_state, training=training)

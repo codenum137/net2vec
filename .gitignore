@@ -103,4 +103,5 @@ ENV/
 *.json
 data/
 models/
+test/
 evaluation_results
