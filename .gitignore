@@ -104,4 +104,5 @@ ENV/
 data/
 models/
 test/
+kan_visualization/
 evaluation_results
