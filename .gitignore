@@ -105,4 +105,6 @@ data/
 models/
 test/
 kan_visualization/
+gradient_sanity_check_kan_full/
+gradient_sanity_check_mlp_full/
 evaluation_results
