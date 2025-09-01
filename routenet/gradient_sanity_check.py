@@ -335,14 +335,90 @@ class GradientSanityChecker:
             f.write(f"{model_type} - Gradient Physical Intuition Validation Results\n")
             f.write("="*60 + "\n")
             f.write(f"Varying Path: {path_to_vary}\n")
-            f.write(f"Traffic Range: {traffic_values[0]:.1f} - {traffic_values[-1]:.1f} Mbps\n\n")
+            f.write(f"Traffic Range: {traffic_values[0]:.1f} - {traffic_values[-1]:.1f} Mbps\n")
+            f.write(f"Number of Traffic Points: {len(traffic_values)}\n\n")
             
-            f.write("Validation Results:\n")
+            # 1. 自影响梯度详细分析
+            self_gradients = diagonal_gradients[:, path_to_vary]
+            positive_self_ratio = np.sum(self_gradients > 0) / len(self_gradients)
+            f.write("1. Self-influence Gradient Analysis (∂D_i/∂T_i):\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"  Gradient Values for Path {path_to_vary}:\n")
+            for i, (traffic, grad) in enumerate(zip(traffic_values, self_gradients)):
+                f.write(f"    Traffic: {traffic:6.1f} Mbps -> Gradient: {grad:12.8f}\n")
+            f.write(f"\n  Statistical Summary:\n")
+            f.write(f"    Positive Ratio: {positive_self_ratio:.2%}\n")
+            f.write(f"    Mean: {np.mean(self_gradients):12.8f}\n")
+            f.write(f"    Std: {np.std(self_gradients):12.8f}\n")
+            f.write(f"    Min: {np.min(self_gradients):12.8f}\n")
+            f.write(f"    Max: {np.max(self_gradients):12.8f}\n")
+            f.write(f"    Status: {'Pass' if validation_results['self_gradient_positive'] else 'Fail'}\n\n")
+            
+            # 2. 交叉影响梯度详细分析
+            f.write("2. Cross-influence Gradient Analysis (∂D_i/∂T_j, i≠j):\n")
+            f.write("-" * 50 + "\n")
+            for key, cross_grad in cross_gradients.items():
+                positive_cross_ratio = np.sum(cross_grad > 0) / len(cross_grad)
+                f.write(f"  {key} (Cross-influence):\n")
+                for i, (traffic, grad) in enumerate(zip(traffic_values, cross_grad)):
+                    f.write(f"    Traffic: {traffic:6.1f} Mbps -> Gradient: {grad:12.8f}\n")
+                f.write(f"    Statistical Summary:\n")
+                f.write(f"      Positive Ratio: {positive_cross_ratio:.2%}\n")
+                f.write(f"      Mean: {np.mean(cross_grad):12.8f}\n")
+                f.write(f"      Std: {np.std(cross_grad):12.8f}\n")
+                f.write(f"      Min: {np.min(cross_grad):12.8f}\n")
+                f.write(f"      Max: {np.max(cross_grad):12.8f}\n\n")
+            
+            # 3. 延迟预测详细分析
+            f.write("3. Delay Prediction Analysis:\n")
+            f.write("-" * 50 + "\n")
+            for path_idx in range(network_config['n_paths']):
+                delays = delay_predictions[:, path_idx]
+                diff = np.diff(delays)
+                monotonic_ratio = np.sum(diff >= -1e-6) / len(diff)
+                f.write(f"  Path {path_idx} Delay Predictions:\n")
+                for i, (traffic, delay) in enumerate(zip(traffic_values, delays)):
+                    f.write(f"    Traffic: {traffic:6.1f} Mbps -> Delay: {delay:12.8f}\n")
+                f.write(f"    Monotonic Increase Ratio: {monotonic_ratio:.2%}\n")
+                f.write(f"    Mean Delay: {np.mean(delays):12.8f}\n")
+                f.write(f"    Delay Range: [{np.min(delays):12.8f}, {np.max(delays):12.8f}]\n\n")
+            
+            # 4. 拥塞敏感性分析
+            low_traffic_idx = len(traffic_values) // 4
+            high_traffic_idx = -len(traffic_values) // 4
+            low_gradient = np.mean(self_gradients[:low_traffic_idx])
+            high_gradient = np.mean(self_gradients[high_traffic_idx:])
+            gradient_increase_ratio = high_gradient / (low_gradient + 1e-9)
+            
+            f.write("4. Congestion Sensitivity Analysis:\n")
+            f.write("-" * 50 + "\n")
+            f.write(f"  Low Traffic Region (first 25% points):\n")
+            f.write(f"    Traffic Range: {traffic_values[0]:.1f} - {traffic_values[low_traffic_idx-1]:.1f} Mbps\n")
+            f.write(f"    Average Gradient: {low_gradient:12.8f}\n")
+            f.write(f"  High Traffic Region (last 25% points):\n")
+            f.write(f"    Traffic Range: {traffic_values[high_traffic_idx]:.1f} - {traffic_values[-1]:.1f} Mbps\n")
+            f.write(f"    Average Gradient: {high_gradient:12.8f}\n")
+            f.write(f"  Gradient Increase Ratio: {gradient_increase_ratio:.4f}x\n")
+            f.write(f"  Status: {'Pass' if validation_results['gradient_increases_with_congestion'] else 'Fail'}\n\n")
+            
+            # 5. 总体验证结果
+            f.write("5. Overall Validation Results:\n")
+            f.write("=" * 50 + "\n")
             f.write(f"  Self-influence Gradient > 0: {'Pass' if validation_results['self_gradient_positive'] else 'Fail'}\n")
             f.write(f"  Cross-influence Gradient > 0: {'Pass' if validation_results['cross_gradient_positive'] else 'Fail'}\n")
             f.write(f"  Delay Monotonic Increase: {'Pass' if validation_results['delay_monotonic'] else 'Fail'}\n")
             f.write(f"  Congestion Sensitivity: {'Pass' if validation_results['gradient_increases_with_congestion'] else 'Fail'}\n")
             f.write(f"\nOverall Physical Intuition Score: {validation_results['physical_intuition_score']:.1%}\n")
+            
+            # 6. 原始数据矩阵
+            f.write(f"\n6. Raw Data Matrices:\n")
+            f.write("=" * 50 + "\n")
+            f.write("Jacobian Matrices for each traffic point:\n")
+            for i, (traffic, jacobian) in enumerate(zip(traffic_values, experiment_results['jacobian_matrices'])):
+                f.write(f"\nTraffic Point {i+1}: {traffic:.1f} Mbps\n")
+                f.write("Jacobian Matrix:\n")
+                for row in jacobian:
+                    f.write("  [" + ", ".join([f"{val:12.8f}" for val in row]) + "]\n")
 
 def main():
     """主函数"""
