@@ -104,9 +104,4 @@ ENV/
 data/
 models/
 test/
-kan_visualization/
-gradient_sanity_check_kan/
-gradient_sanity_check_mlp/
-original_data_validation/
-original_routenet_gradient_check/
-evaluation_results
+result/

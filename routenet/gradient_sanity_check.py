@@ -150,18 +150,52 @@ class GradientSanityChecker:
         
         return results
     
+    def _analyze_path_topology(self, network_config):
+        """
+        分析网络拓扑，找出路径间的链路共享关系
+        
+        Returns:
+            shared_links_matrix: [n_paths, n_paths] 布尔矩阵，
+                                shared_links_matrix[i][j] = True 表示路径i和路径j共享至少一条链路
+        """
+        n_paths = network_config['n_paths']
+        links = network_config['links']
+        paths = network_config['paths']
+        
+        # 构建每条路径使用的链路集合
+        path_links = [set() for _ in range(n_paths)]
+        
+        for link_idx, path_idx in zip(links, paths):
+            path_links[path_idx].add(link_idx)
+        
+        # 构建路径间共享链路矩阵
+        shared_links_matrix = np.zeros((n_paths, n_paths), dtype=bool)
+        shared_links_count = np.zeros((n_paths, n_paths), dtype=int)
+        
+        for i in range(n_paths):
+            for j in range(n_paths):
+                if i != j:
+                    shared_links = path_links[i].intersection(path_links[j])
+                    shared_links_matrix[i][j] = len(shared_links) > 0
+                    shared_links_count[i][j] = len(shared_links)
+        
+        return shared_links_matrix, shared_links_count, path_links
+
     def validate_physical_intuition(self, experiment_results, network_config, 
                                    path_to_vary, output_dir):
         """
-        验证梯度的物理意义
+        验证梯度的物理意义 (拓扑感知版本)
         
         物理直觉验证标准:
         1. 自影响梯度 J_ii > 0：路径自己的流量增加应该增加自己的延迟
-        2. 交叉影响梯度 J_ij > 0：共享瓶颈链路的路径流量增加应该增加其他路径延迟  
+        2. 交叉影响梯度 J_ij > 0：仅对共享链路的路径验证交叉影响
         3. 接近拥塞时梯度增大：当流量接近链路容量时，梯度应该显著增大
         4. 延迟单调递增：随着流量增加，延迟应该单调递增
         """
         os.makedirs(output_dir, exist_ok=True)
+        
+        # 分析网络拓扑
+        shared_links_matrix, shared_links_count, path_links = self._analyze_path_topology(network_config)
         
         traffic_values = experiment_results['traffic_values']
         delay_predictions = experiment_results['delay_predictions']
@@ -176,17 +210,34 @@ class GradientSanityChecker:
             'cross_gradient_positive': True,
             'delay_monotonic': True,
             'gradient_increases_with_congestion': True,
-            'physical_intuition_score': 0.0
+            'physical_intuition_score': 0.0,
+            'topology_info': {
+                'shared_links_matrix': shared_links_matrix,
+                'shared_links_count': shared_links_count,
+                'path_links': path_links
+            }
         }
         
         print("\n" + "="*60)
-        print("梯度物理意义验证结果")
+        print("梯度物理意义验证结果 (拓扑感知)")
         print("="*60)
+        
+        # 打印拓扑信息
+        print("\n0. 网络拓扑分析:")
+        for i in range(n_paths):
+            print(f"   路径 {i} 使用链路: {sorted(list(path_links[i]))}")
+        
+        print("\n   路径间链路共享关系:")
+        for i in range(n_paths):
+            for j in range(n_paths):
+                if i != j and shared_links_matrix[i][j]:
+                    shared_links = path_links[i].intersection(path_links[j])
+                    print(f"   路径 {i} ↔ 路径 {j}: 共享链路 {sorted(list(shared_links))} ({shared_links_count[i][j]} 条)")
         
         # 1. 验证自影响梯度 J_ii > 0
         self_gradients = diagonal_gradients[:, path_to_vary]
         positive_self_ratio = np.sum(self_gradients > 0) / len(self_gradients)
-        print(f"1. 自影响梯度 J_{path_to_vary}{path_to_vary} > 0:")
+        print(f"\n1. 自影响梯度 J_{path_to_vary}{path_to_vary} > 0:")
         print(f"   正值比例: {positive_self_ratio:.2%}")
         print(f"   平均值: {np.mean(self_gradients):.6f}")
         print(f"   范围: [{np.min(self_gradients):.6f}, {np.max(self_gradients):.6f}]")
@@ -194,15 +245,47 @@ class GradientSanityChecker:
         if positive_self_ratio < 0.8:
             validation_results['self_gradient_positive'] = False
         
-        # 2. 验证交叉影响梯度（对共享链路的路径）
-        print(f"\n2. 交叉影响梯度分析:")
+        # 2. 拓扑感知的交叉影响梯度验证
+        print(f"\n2. 交叉影响梯度分析 (拓扑感知):")
+        
+        cross_gradient_validations = []
+        
         for key, cross_grad in cross_gradients.items():
-            positive_cross_ratio = np.sum(cross_grad > 0) / len(cross_grad)
-            print(f"   {key} > 0: {positive_cross_ratio:.2%}")
-            print(f"   平均值: {np.mean(cross_grad):.6f}")
-            
-            if positive_cross_ratio < 0.6:
-                validation_results['cross_gradient_positive'] = False
+            # 解析梯度键：J_ij 表示 ∂D_i/∂T_j
+            parts = key.split('_')
+            if len(parts) == 2:
+                i = int(parts[1][0])  # 受影响的路径 i
+                j = int(parts[1][1])  # 影响的路径 j (应该是path_to_vary)
+                
+                # 检查路径i和路径j是否共享链路
+                if shared_links_matrix[i][j]:
+                    # 共享链路，期望正梯度
+                    positive_cross_ratio = np.sum(cross_grad > 0) / len(cross_grad)
+                    shared_links = path_links[i].intersection(path_links[j])
+                    
+                    print(f"   {key} > 0 (共享链路 {sorted(list(shared_links))}): {positive_cross_ratio:.2%}")
+                    print(f"     平均值: {np.mean(cross_grad):.6f}")
+                    
+                    cross_gradient_validations.append(positive_cross_ratio >= 0.6)
+                    
+                else:
+                    # 不共享链路，交叉影响应该较小，不强制要求正值
+                    positive_cross_ratio = np.sum(cross_grad > 0) / len(cross_grad)
+                    avg_magnitude = np.mean(np.abs(cross_grad))
+                    
+                    print(f"   {key} (无共享链路): {positive_cross_ratio:.2%}")
+                    print(f"     平均值: {np.mean(cross_grad):.6f}, 平均幅度: {avg_magnitude:.6f}")
+                    
+                    # 对于不共享链路的路径，不纳入验证标准，但记录信息
+                    print(f"     → 无共享链路，交叉影响预期较小")
+        
+        # 只有共享链路的交叉梯度需要满足正值要求
+        if cross_gradient_validations:
+            validation_results['cross_gradient_positive'] = all(cross_gradient_validations)
+        else:
+            # 如果没有共享链路的路径对，这项验证自动通过
+            validation_results['cross_gradient_positive'] = True
+            print(f"   注意: 路径 {path_to_vary} 与其他路径无共享链路，交叉梯度验证自动通过")
         
         # 3. 验证延迟单调性
         print(f"\n3. 延迟单调性验证:")
@@ -429,11 +512,11 @@ def main():
                        help='预测目标')
     parser.add_argument('--output_dir', default='gradient_sanity_check', 
                        help='输出目录')
-    parser.add_argument('--traffic_min', type=float, default=5.0,
+    parser.add_argument('--traffic_min', type=float, default=0.1,
                        help='最小流量值')
-    parser.add_argument('--traffic_max', type=float, default=40.0,
+    parser.add_argument('--traffic_max', type=float, default=0.9,
                        help='最大流量值')
-    parser.add_argument('--num_points', type=int, default=20,
+    parser.add_argument('--num_points', type=int, default=10,
                        help='流量采样点数量')
     
     args = parser.parse_args()
