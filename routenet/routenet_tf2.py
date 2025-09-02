@@ -338,8 +338,43 @@ class RouteNet(tf.keras.Model):
         return self.final_layer(final_input)
 
 # ==============================================================================
-# 3. 损失函数 (支持延迟和丢包两种任务)
+# 3. 损失函数 (支持延迟和丢包两种任务 + 物理约束)
 # ==============================================================================
+
+def gradient_constraint_loss(model, features, predictions):
+    """
+    梯度约束损失函数 - 期望值梯度约束损失
+    强制模型学习符合物理直觉的"流量-延迟"正相关关系
+    
+    根据公式: L_gradient = ReLU(-E_batch[gk]) = max(0, -1/|batch| * sum(gk))
+    其中 gk = ∂loc_k/∂T_k 是自影响梯度
+    """
+    traffic = features['traffic']
+    
+    # 只处理延迟预测任务
+    if predictions.shape[1] != 2:
+        return tf.constant(0.0, dtype=tf.float32)
+    
+    with tf.GradientTape() as grad_tape:
+        grad_tape.watch(traffic)
+        # 重新前向传播计算预测值
+        pred_with_grad = model(features, training=True)
+        # 延迟预测的期望值（loc参数）
+        loc = pred_with_grad[:, 0]
+    
+    # 计算自影响梯度: ∂loc_k/∂T_k
+    gradients = grad_tape.gradient(loc, traffic)
+    
+    if gradients is None:
+        return tf.constant(0.0, dtype=tf.float32)
+    
+    # 计算批次内的平均梯度
+    batch_mean_gradient = tf.reduce_mean(gradients)
+    
+    # ReLU函数：如果平均梯度为负（违反物理直觉），则施加惩罚
+    gradient_penalty = tf.nn.relu(-batch_mean_gradient)
+    
+    return gradient_penalty
 
 def heteroscedastic_loss(y_true, y_pred):
     """异方差损失函数 - 用于延迟预测
@@ -397,37 +432,119 @@ def binomial_loss(y_true, y_pred):
     
     return loss
 
-def create_model_and_loss_fn(config, target, use_kan=False):
-    """根据target参数创建相应的模型和损失函数"""
+def physics_informed_loss(y_true, y_pred, model, features, lambda_physics=0.1):
+    """
+    物理约束损失函数 (Physics-Informed Loss Function)
+    
+    总损失函数: L_total = L_hetero + λ * L_gradient
+    - L_hetero: 异方差损失函数（数据拟合项）
+    - L_gradient: 梯度约束损失（物理约束项）
+    - λ: 平衡超参数
+    
+    Args:
+        y_true: 真实标签
+        y_pred: 模型预测
+        model: 模型实例（用于计算梯度）
+        features: 输入特征（包含traffic）
+        lambda_physics: 物理约束权重系数
+    """
+    # 数据拟合项：异方差损失
+    l_hetero = heteroscedastic_loss(y_true, y_pred)
+    
+    # 物理约束项：梯度约束损失
+    l_gradient = gradient_constraint_loss(model, features, y_pred)
+    
+    # 总损失
+    l_total = l_hetero + lambda_physics * l_gradient
+    
+    return l_total, l_hetero, l_gradient
+
+def create_model_and_loss_fn(config, target, use_kan=False, use_physics_loss=False, lambda_physics=0.1):
+    """根据target参数创建相应的模型和损失函数
+    
+    Args:
+        config: 模型配置
+        target: 预测目标 ('delay' 或 'drops')
+        use_kan: 是否使用KAN架构
+        use_physics_loss: 是否使用物理约束损失函数
+        lambda_physics: 物理约束权重系数
+    """
+    model_type = "KAN-based" if use_kan else "MLP-based"
+    loss_type = "physics-informed" if use_physics_loss else "standard"
+    
     if target == 'delay':
         # 延迟预测模型
         model = RouteNet(config, output_units=2, final_activation=None, use_kan=use_kan)
-        loss_fn = heteroscedastic_loss
-        model_type = "KAN-based" if use_kan else "MLP-based"
-        print("Created {} delay prediction model with heteroscedastic loss".format(model_type))
+        
+        if use_physics_loss:
+            # 使用物理约束损失函数
+            def loss_fn(labels, predictions, model=model, features=None):
+                if features is None:
+                    # 如果没有features，退回到标准异方差损失
+                    return heteroscedastic_loss(labels, predictions)
+                return physics_informed_loss(labels, predictions, model, features, lambda_physics)
+        else:
+            # 使用标准异方差损失
+            loss_fn = heteroscedastic_loss
+            
+        print("Created {} delay prediction model with {} heteroscedastic loss (λ={})".format(
+            model_type, loss_type, lambda_physics if use_physics_loss else "N/A"))
+            
     elif target == 'drops':
-        # 丢包预测模型
+        # 丢包预测模型 - 暂不支持物理约束
         model = RouteNet(config, output_units=1, final_activation=None, use_kan=use_kan)
         loss_fn = binomial_loss
-        model_type = "KAN-based" if use_kan else "MLP-based"
+        if use_physics_loss:
+            print("Warning: Physics-informed loss is not implemented for drops prediction. Using standard binomial loss.")
         print("Created {} drop prediction model with binomial loss".format(model_type))
     else:
         raise ValueError("Unsupported target: {}. Choose 'delay' or 'drops'".format(target))
     
     return model, loss_fn
 
-@tf.function(reduce_retracing=True)
-def train_step(model, optimizer, features, labels, loss_fn):
+@tf.function
+def train_step(model, optimizer, features, labels, loss_fn, use_physics_loss=False):
+    """训练步骤 - 支持物理约束损失"""
     with tf.GradientTape() as tape:
         predictions = model(features, training=True)
-        loss = loss_fn(labels, predictions)
+        
+        if use_physics_loss:
+            # 物理约束损失函数需要额外参数
+            if hasattr(loss_fn, '__call__'):
+                try:
+                    # 尝试调用物理约束损失函数
+                    loss_result = loss_fn(labels, predictions, model, features)
+                    if isinstance(loss_result, tuple):
+                        # 返回 (total_loss, hetero_loss, gradient_loss)
+                        loss, l_hetero, l_gradient = loss_result
+                    else:
+                        loss = loss_result
+                        l_hetero = tf.constant(0.0)
+                        l_gradient = tf.constant(0.0)
+                except:
+                    # 退回到标准损失
+                    loss = loss_fn(labels, predictions)
+                    l_hetero = loss
+                    l_gradient = tf.constant(0.0)
+            else:
+                loss = loss_fn(labels, predictions)
+                l_hetero = loss
+                l_gradient = tf.constant(0.0)
+        else:
+            # 标准损失函数
+            loss = loss_fn(labels, predictions)
+            l_hetero = loss
+            l_gradient = tf.constant(0.0)
+            
+        # 添加模型正则化损失
         loss += sum(model.losses)
         
     gradients = tape.gradient(loss, model.trainable_variables)
     optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-    return loss, predictions
+    
+    return loss, predictions, l_hetero, l_gradient
 
-@tf.function(reduce_retracing=True)
+@tf.function  
 def eval_step(model, features, labels, loss_fn):
     predictions = model(features, training=False)
     loss = loss_fn(labels, predictions)
@@ -469,7 +586,10 @@ def main(args):
     print("Found {} evaluation files.".format(len(eval_files)))
 
     # 根据target创建模型和损失函数
-    model, loss_fn = create_model_and_loss_fn(config, args.target, use_kan=args.kan)
+    model, loss_fn = create_model_and_loss_fn(config, args.target, 
+                                             use_kan=args.kan, 
+                                             use_physics_loss=args.physics_loss,
+                                             lambda_physics=args.lambda_physics)
     
     # 创建动态学习率调度器
     if args.lr_schedule == 'exponential':
@@ -529,12 +649,16 @@ def main(args):
         
         # 训练
         total_train_loss = 0.0
+        total_hetero_loss = 0.0
+        total_gradient_loss = 0.0
         train_step_count = 0
         pbar = tqdm(train_dataset, desc="Training Epoch {}".format(epoch+1))
         
         for features, labels in pbar:
-            loss, predictions = train_step(model, optimizer, features, labels, loss_fn)
+            loss, predictions, l_hetero, l_gradient = train_step(model, optimizer, features, labels, loss_fn, use_physics_loss=args.physics_loss)
             total_train_loss += loss
+            total_hetero_loss += l_hetero
+            total_gradient_loss += l_gradient
             train_step_count += 1
             global_step += 1
             
@@ -542,18 +666,36 @@ def main(args):
             if global_step % 10 == 0:
                 with train_summary_writer.as_default():
                     tf.summary.scalar('batch_loss', loss, step=global_step)
+                    if args.physics_loss:
+                        tf.summary.scalar('batch_hetero_loss', l_hetero, step=global_step)
+                        tf.summary.scalar('batch_gradient_loss', l_gradient, step=global_step)
                     # 记录当前学习率
                     current_lr = optimizer.learning_rate
                     if hasattr(current_lr, 'numpy'):
                         current_lr = current_lr.numpy()
                     tf.summary.scalar('learning_rate', current_lr, step=global_step)
             
-            pbar.set_postfix({'loss': '{:.4f}'.format(loss), 'step': global_step})
+            # 更新进度条显示
+            if args.physics_loss:
+                pbar.set_postfix({
+                    'total': '{:.4f}'.format(loss), 
+                    'hetero': '{:.4f}'.format(l_hetero),
+                    'grad': '{:.4f}'.format(l_gradient),
+                    'step': global_step
+                })
+            else:
+                pbar.set_postfix({'loss': '{:.4f}'.format(loss), 'step': global_step})
+                
         avg_train_loss = total_train_loss / train_step_count
+        avg_hetero_loss = total_hetero_loss / train_step_count 
+        avg_gradient_loss = total_gradient_loss / train_step_count
 
         # 记录训练的平均损失
         with train_summary_writer.as_default():
             tf.summary.scalar('epoch_loss', avg_train_loss, step=epoch + 1)
+            if args.physics_loss:
+                tf.summary.scalar('epoch_hetero_loss', avg_hetero_loss, step=epoch + 1)
+                tf.summary.scalar('epoch_gradient_loss', avg_gradient_loss, step=epoch + 1)
 
         # 评估
         total_eval_loss = 0.0
@@ -597,9 +739,15 @@ def main(args):
                             print("Reducing learning rate from {:.6f} to {:.6f}".format(old_lr, new_lr))
                             reduce_lr_callback.wait = 0
 
-        print("Epoch {} finished. Avg Train Loss: {:.4f}, Avg Eval Loss: {:.4f}, LR: {:.6f}".format(
-            epoch + 1, avg_train_loss, avg_eval_loss, 
-            optimizer.learning_rate.numpy() if hasattr(optimizer.learning_rate, 'numpy') else optimizer.learning_rate))
+        # 输出epoch结果
+        if args.physics_loss:
+            print("Epoch {} finished. Total Loss: {:.4f} (Hetero: {:.4f}, Gradient: {:.4f}), Eval Loss: {:.4f}, LR: {:.6f}".format(
+                epoch + 1, avg_train_loss, avg_hetero_loss, avg_gradient_loss, avg_eval_loss,
+                optimizer.learning_rate.numpy() if hasattr(optimizer.learning_rate, 'numpy') else optimizer.learning_rate))
+        else:
+            print("Epoch {} finished. Avg Train Loss: {:.4f}, Avg Eval Loss: {:.4f}, LR: {:.6f}".format(
+                epoch + 1, avg_train_loss, avg_eval_loss, 
+                optimizer.learning_rate.numpy() if hasattr(optimizer.learning_rate, 'numpy') else optimizer.learning_rate))
 
         # 保存最佳模型
         if avg_eval_loss < best_eval_loss:
@@ -661,6 +809,12 @@ if __name__ == '__main__':
                       help='Factor to reduce learning rate on plateau (only for plateau schedule)')
     parser.add_argument('--plateau_patience', type=int, default=3,
                       help='Number of epochs to wait before reducing LR on plateau (only for plateau schedule)')
+    
+    # 物理约束损失参数
+    parser.add_argument('--physics_loss', action='store_true',
+                      help='Enable physics-informed loss function for delay prediction')
+    parser.add_argument('--lambda_physics', type=float, default=0.1,
+                      help='Weight coefficient for physics constraint term (default: 0.1)')
     
     # 用于cosine和polynomial调度的steps_per_epoch估计
     parser.add_argument('--steps_per_epoch', type=int, default=100,
