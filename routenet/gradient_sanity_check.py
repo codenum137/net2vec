@@ -23,6 +23,26 @@ class GradientSanityChecker:
         self.use_kan = use_kan
         self.target = target
     
+    def _apply_routenet_scaling(self, features):
+        """
+        应用与routenet_tf2.py中相同的数据标准化
+        
+        RouteNet标准化公式:
+        - 流量: (val - 0.18) / 0.15
+        - 容量: val / 10.0
+        """
+        scaled_features = features.copy()
+        
+        # 标准化流量
+        if 'traffic' in features:
+            scaled_features['traffic'] = (features['traffic'] - 0.18) / 0.15
+        
+        # 标准化容量
+        if 'capacities' in features:
+            scaled_features['capacities'] = features['capacities'] / 10.0
+            
+        return scaled_features
+    
     def create_controlled_network(self):
         """
         创建一个可控的简单网络拓扑
@@ -37,14 +57,18 @@ class GradientSanityChecker:
         - 路径 1: 0->1->4 (使用链路 0, 3) 
         - 路径 2: 1->2->3 (使用链路 1, 2)
         
-        关键特性：路径0和路径2共享链路1，所有路径共享链路0
         """
         n_nodes = 5
         n_links = 4
         n_paths = 3
         
-        # 链路容量设置：故意让链路1成为瓶颈
-        capacities = np.array([200.0, 30.0, 150.0, 100.0], dtype=np.float32)  # 链路1容量最小
+        # 链路容量设置：基于真实数据集特征 (容量范围: 10-40, 典型值: [10,10,10,40])
+        # 使用数据集中的典型容量值，确保与训练数据一致
+        capacities = np.array([10.0, 10.0, 40.0, 20.0], dtype=np.float32)  
+        # 链路0: 10.0 (被路径0,1共享，低容量，容易形成瓶颈)
+        # 链路1: 10.0 (被路径0,2共享，低容量，容易形成瓶颈) 
+        # 链路2: 40.0 (仅路径2使用，高容量)
+        # 链路3: 20.0 (仅路径1使用，中等容量)
         
         # 路径-链路映射，注意数据类型
         # 路径0: 链路0, 链路1  
@@ -54,8 +78,8 @@ class GradientSanityChecker:
         paths = np.array([0, 0, 1, 1, 2, 2], dtype=np.int32)  # 对应的路径索引  
         sequences = np.array([0, 1, 0, 1, 0, 1], dtype=np.int32)  # 路径内序列
         
-        # 基础流量配置
-        base_traffic = np.array([10.0, 8.0, 12.0], dtype=np.float32)  # 基础流量
+        # 基础流量配置：基于真实数据集特征 (流量范围: 0.086-1.103, 典型值: [0.33,0.55,0.78,0.91])
+        base_traffic = np.array([0.33, 0.55, 0.78], dtype=np.float32)  # 使用数据集25%-75%分位数
         
         # 数据包数量
         packets = np.array([1000.0, 800.0, 1200.0], dtype=np.float32)
@@ -76,14 +100,14 @@ class GradientSanityChecker:
         return network_config
     
     def traffic_sweep_experiment(self, network_config, path_to_vary=0, 
-                               traffic_range=(5.0, 40.0), num_points=20):
+                               traffic_range=(0.1, 1.0), num_points=20):
         """
         流量扫描实验：固定其他路径流量，变化指定路径流量
         
         Args:
             network_config: 网络配置
             path_to_vary: 要变化流量的路径索引
-            traffic_range: 流量变化范围 (min, max)
+            traffic_range: 流量变化范围 (min, max) - 基于数据集实际范围0.086-1.103
             num_points: 采样点数量
         
         Returns:
@@ -114,8 +138,8 @@ class GradientSanityChecker:
             current_traffic = base_traffic.copy()
             current_traffic[path_to_vary] = traffic_val
             
-            # 构造样本特征
-            sample_features = {
+            # 构造原始样本特征
+            raw_features = {
                 'traffic': current_traffic,
                 'capacities': network_config['capacities'],
                 'links': network_config['links'],
@@ -125,6 +149,9 @@ class GradientSanityChecker:
                 'n_paths': network_config['n_paths'],
                 'packets': network_config['packets']
             }
+            
+            # ⚠️ 重要：应用与routenet_tf2.py相同的数据标准化
+            sample_features = self._apply_routenet_scaling(raw_features)
             
             # 计算雅可比矩阵和延迟预测
             jacobian, delay_pred = self.analyzer.compute_jacobian(sample_features)
@@ -346,7 +373,7 @@ class GradientSanityChecker:
         diagonal_gradients = experiment_results['diagonal_gradients']
         cross_gradients = experiment_results['cross_gradients']
         
-        # 创建综合图表
+        # 创建综合图表 (移除右下角子图)
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
         
         # 1. 延迟 vs 流量
@@ -383,27 +410,39 @@ class GradientSanityChecker:
         ax3.grid(True, alpha=0.3)
         ax3.axhline(y=0, color='k', linestyle='--', alpha=0.5)
         
-        # 4. 验证结果总览
+        # 4. 验证结果文本总结 (替代原来的条形图)
         ax4 = axes[1, 1]
-        metrics = ['Self>0', 'Cross>0', 'Monotonic', 'Congest-Sens']
+        ax4.axis('off')  # 隐藏坐标轴
+        
+        # 创建验证结果文本总结
+        metrics = ['Self-gradient > 0', 'Cross-gradient > 0', 'Delay Monotonic', 'Congestion Sensitivity']
         scores = [
             validation_results['self_gradient_positive'],
             validation_results['cross_gradient_positive'],
             validation_results['delay_monotonic'],
             validation_results['gradient_increases_with_congestion']
         ]
-        colors_bar = ['green' if s else 'red' for s in scores]
         
-        bars = ax4.bar(metrics, [1 if s else 0 for s in scores], color=colors_bar)
-        ax4.set_ylabel('Validation Pass')
-        ax4.set_title(f'Physical Intuition Validation\nScore: {validation_results["physical_intuition_score"]:.1%}')
-        ax4.set_ylim(0, 1.2)
+        summary_text = f"Physical Intuition Validation Summary\n"
+        summary_text += f"Overall Score: {validation_results['physical_intuition_score']:.1%}\n\n"
         
-        # 添加分数标签
-        for bar, score in zip(bars, scores):
-            height = bar.get_height()
-            ax4.text(bar.get_x() + bar.get_width()/2., height + 0.05,
-                    '✓' if score else '✗', ha='center', va='bottom', fontsize=16)
+        for metric, score in zip(metrics, scores):
+            status = "✓ PASS" if score else "✗ FAIL"
+            summary_text += f"{metric}: {status}\n"
+        
+        # 添加详细统计信息
+        self_pos_ratio = np.sum(self_gradients > 0) / len(self_gradients)
+        summary_text += f"\nDetailed Statistics:\n"
+        summary_text += f"Self-gradient positive ratio: {self_pos_ratio:.1%}\n"
+        summary_text += f"Self-gradient mean: {np.mean(self_gradients):.6f}\n"
+        
+        for key, cross_grad in cross_gradients.items():
+            cross_pos_ratio = np.sum(cross_grad > 0) / len(cross_grad)
+            summary_text += f"{key} positive ratio: {cross_pos_ratio:.1%}\n"
+        
+        ax4.text(0.05, 0.95, summary_text, transform=ax4.transAxes, fontsize=10,
+                verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
         
         model_type = "KAN Model" if self.use_kan else "MLP Model"
         fig.suptitle(f'{model_type} - Gradient Physical Intuition Validation (Varying Path {path_to_vary})', 
@@ -510,12 +549,12 @@ def main():
     parser.add_argument('--use_kan', action='store_true', help='使用KAN模型')
     parser.add_argument('--target', default='delay', choices=['delay', 'drops'], 
                        help='预测目标')
-    parser.add_argument('--output_dir', default='gradient_sanity_check', 
+    parser.add_argument('--output_dir', default='result/physics/kan', 
                        help='输出目录')
     parser.add_argument('--traffic_min', type=float, default=0.1,
-                       help='最小流量值')
-    parser.add_argument('--traffic_max', type=float, default=0.9,
-                       help='最大流量值')
+                       help='最小流量值 (基于数据集范围0.086-1.103)')
+    parser.add_argument('--traffic_max', type=float, default=1.0,
+                       help='最大流量值 (基于数据集范围0.086-1.103)')
     parser.add_argument('--num_points', type=int, default=10,
                        help='流量采样点数量')
     

@@ -337,7 +337,7 @@ def main():
     parser.add_argument('--data_dir', required=True, help='TFRecord data directory')
     parser.add_argument('--num_samples', type=int, default=300, help='Number of samples to analyze')
     parser.add_argument('--max_files', type=int, default=3, help='Maximum TFRecord files to load')
-    parser.add_argument('--output_dir', default='data_validation', help='Output directory')
+    parser.add_argument('--output_dir', default='result/dataset/data_validation', help='Output directory')
     
     args = parser.parse_args()
     
