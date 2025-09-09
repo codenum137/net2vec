@@ -204,9 +204,8 @@ def plot_linear_focus_cdf(nsfnet_errors, gbn_errors, output_dir, model_suffix=""
     
     plt.figure(figsize=(12, 8))
     
-    for metric in ['delay', 'jitter', 'drops']:
+    for metric in ['delay', 'jitter']:
         if metric in nsfnet_errors and len(nsfnet_errors[metric]) > 0:
-            # 不取绝对值，保留正负信息
             sorted_errors = np.sort(nsfnet_errors[metric])
             cdf_values = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
             plt.plot(sorted_errors, cdf_values, 
@@ -214,7 +213,6 @@ def plot_linear_focus_cdf(nsfnet_errors, gbn_errors, output_dir, model_suffix=""
                     linewidth=2.5, label='NSFNet {}'.format(metric.upper()))
         
         if metric in gbn_errors and len(gbn_errors[metric]) > 0:
-            # 不取绝对值，保留正负信息
             sorted_errors = np.sort(gbn_errors[metric])
             cdf_values = np.arange(1, len(sorted_errors) + 1) / len(sorted_errors)
             plt.plot(sorted_errors, cdf_values,
@@ -237,7 +235,7 @@ def plot_linear_focus_cdf(nsfnet_errors, gbn_errors, output_dir, model_suffix=""
     # 收集所有误差（包括正负值）来设置x轴范围
     all_signed_errors = []
     for errors_dict in [nsfnet_errors, gbn_errors]:
-        for metric in ['delay', 'jitter', 'drops']:
+        for metric in ['delay', 'jitter']:
             if metric in errors_dict and len(errors_dict[metric]) > 0:
                 all_signed_errors.extend(errors_dict[metric])
     
@@ -257,9 +255,9 @@ def plot_linear_focus_cdf(nsfnet_errors, gbn_errors, output_dir, model_suffix=""
     detailed_stats = []
     for topo in ['nsfnet', 'gbn']:
         errors = nsfnet_errors if topo == 'nsfnet' else gbn_errors
-        for metric in ['delay', 'jitter', 'drops']:
+        for metric in ['delay', 'jitter']:
             if metric in errors and len(errors[metric]) > 0:
-                mean_error = np.mean(errors[metric])  # 包含符号的平均误差
+                mean_error = np.mean(errors[metric])
                 abs_errors = np.abs(errors[metric])
                 median_abs_error = np.median(abs_errors)
                 detailed_stats.append('{} {}: Mean={:.4f}, |Med|={:.4f}\n'.format(
@@ -290,11 +288,10 @@ def print_evaluation_summary(nsfnet_errors, gbn_errors):
         print("\n{}:".format(topo_name))
         print("-" * 40)
         
-        for metric in ['delay', 'jitter', 'drops']:
+        for metric in ['delay', 'jitter']:
             if metric in errors and len(errors[metric]) > 0:
                 abs_errors = np.abs(errors[metric])
-                unit = " (drop rate)" if metric == 'drops' else ""
-                print("  {}{}: {} samples".format(metric.upper(), unit, len(abs_errors)))
+                print("  {}: {} samples".format(metric.upper(), len(abs_errors)))
                 print("    Mean Abs Error: {:.4f}".format(np.mean(abs_errors)))
                 print("    Median Abs Error: {:.4f}".format(np.median(abs_errors)))
                 print("    P90 Abs Error: {:.4f}".format(np.percentile(abs_errors, 90)))
@@ -306,8 +303,6 @@ def main():
     parser = argparse.ArgumentParser(description='Comprehensive RouteNet Evaluation')
     parser.add_argument('--delay_model_dir', type=str, required=True,
                       help='Directory containing delay prediction model')
-    parser.add_argument('--drops_model_dir', type=str, required=True,
-                      help='Directory containing drops prediction model')
     parser.add_argument('--nsfnet_test_dir', type=str, required=True,
                       help='Directory containing NSFNet test data')
     parser.add_argument('--gbn_test_dir', type=str, required=True,
@@ -340,13 +335,11 @@ def main():
     model_type = "KAN" if args.kan else "MLP"
     print("Starting comprehensive RouteNet evaluation with {} models...".format(model_type))
     print("Delay model dir: {}".format(args.delay_model_dir))
-    print("Drops model dir: {}".format(args.drops_model_dir))
     print("NSFNet test dir: {}".format(args.nsfnet_test_dir))
     print("GBN test dir: {}".format(args.gbn_test_dir))
     
     # 加载模型
     delay_model, delay_weight_path = load_model(args.delay_model_dir, 'delay', config, use_kan=args.kan)
-    drops_model, drops_weight_path = load_model(args.drops_model_dir, 'drops', config, use_kan=args.kan)
     
     # 创建数据集
     nsfnet_files = tf.io.gfile.glob(os.path.join(args.nsfnet_test_dir, '*.tfrecords'))
@@ -363,12 +356,10 @@ def main():
     for dataset in [nsfnet_dataset.take(1)]:
         for features, labels in dataset:
             _ = delay_model(features, training=False)
-            _ = drops_model(features, training=False)
             break
     
     # 加载权重
     delay_model.load_weights(delay_weight_path)
-    drops_model.load_weights(drops_weight_path)
     print("Models loaded successfully!")
     
     # 评估NSFNet（同拓扑）
@@ -380,15 +371,7 @@ def main():
     _, _, nsfnet_delay_jitter_errors = evaluate_delay_jitter_model(
         delay_model, nsfnet_dataset, args.num_samples
     )
-    
-    # 重新创建dataset用于drops评估
-    nsfnet_dataset_drops = create_dataset(nsfnet_files, args.batch_size, is_training=False)
-    _, _, nsfnet_drops_errors = evaluate_drops_model(
-        drops_model, nsfnet_dataset_drops, args.num_samples
-    )
-    
-    # 合并NSFNet结果
-    nsfnet_errors = {**nsfnet_delay_jitter_errors, **nsfnet_drops_errors}
+    nsfnet_errors = nsfnet_delay_jitter_errors
     
     # 评估GBN（跨拓扑）
     print("\n" + "="*50)
@@ -399,15 +382,7 @@ def main():
     _, _, gbn_delay_jitter_errors = evaluate_delay_jitter_model(
         delay_model, gbn_dataset, args.num_samples
     )
-    
-    # 重新创建dataset用于drops评估
-    gbn_dataset_drops = create_dataset(gbn_files, args.batch_size, is_training=False)
-    _, _, gbn_drops_errors = evaluate_drops_model(
-        drops_model, gbn_dataset_drops, args.num_samples
-    )
-    
-    # 合并GBN结果
-    gbn_errors = {**gbn_delay_jitter_errors, **gbn_drops_errors}
+    gbn_errors = gbn_delay_jitter_errors
     
     # 打印评估摘要
     print_evaluation_summary(nsfnet_errors, gbn_errors)
