@@ -341,68 +341,68 @@ class RouteNet(tf.keras.Model):
 # 3. 损失函数 (支持延迟和丢包两种任务 + 物理约束)
 # ==============================================================================
 
-def gradient_constraint_loss(model, features, predictions):
-    """
-    梯度约束损失函数 - 期望值梯度约束损失
-    强制模型学习符合物理直觉的"流量-延迟"正相关关系
-    
-    根据公式: L_gradient = ReLU(-E_batch[gk]) = max(0, -1/|batch| * sum(gk))
-    其中 gk = ∂loc_k/∂T_k 是自影响梯度
-    """
-    traffic = features['traffic']
-    
-    # 只处理延迟预测任务
-    if predictions.shape[1] != 2:
-        return tf.constant(0.0, dtype=tf.float32)
-    
-    with tf.GradientTape() as grad_tape:
-        grad_tape.watch(traffic)
-        # 重新前向传播计算预测值
-        pred_with_grad = model(features, training=True)
-        # 延迟预测的期望值（loc参数）
-        loc = pred_with_grad[:, 0]
-    
-    # 计算自影响梯度: ∂loc_k/∂T_k
-    gradients = grad_tape.gradient(loc, traffic)
-    
-    if gradients is None:
-        return tf.constant(0.0, dtype=tf.float32)
-    
-    # 计算批次内的平均梯度
-    batch_mean_gradient = tf.reduce_mean(gradients)
-    
-    # ReLU函数：如果平均梯度为负（违反物理直觉），则施加惩罚
-    gradient_penalty = tf.nn.relu(-batch_mean_gradient)
-    
-    return gradient_penalty
-
 # def gradient_constraint_loss(model, features, predictions):
 #     """
-#     梯度约束损失函数 - 【更新为“逐样本硬约束”】
+#     梯度约束损失函数 - 期望值梯度约束损失
 #     强制模型学习符合物理直觉的"流量-延迟"正相关关系
     
-#     根据新公式: L_gradient = E_batch[ReLU(-gk)] = mean(max(0, -gk))
+#     根据公式: L_gradient = ReLU(-E_batch[gk]) = max(0, -1/|batch| * sum(gk))
+#     其中 gk = ∂loc_k/∂T_k 是自影响梯度
 #     """
 #     traffic = features['traffic']
     
+#     # 只处理延迟预测任务
 #     if predictions.shape[1] != 2:
 #         return tf.constant(0.0, dtype=tf.float32)
     
 #     with tf.GradientTape() as grad_tape:
 #         grad_tape.watch(traffic)
+#         # 重新前向传播计算预测值
 #         pred_with_grad = model(features, training=True)
+#         # 延迟预测的期望值（loc参数）
 #         loc = pred_with_grad[:, 0]
     
+#     # 计算自影响梯度: ∂loc_k/∂T_k
 #     gradients = grad_tape.gradient(loc, traffic)
     
 #     if gradients is None:
 #         return tf.constant(0.0, dtype=tf.float32)
     
-#     # 【核心修改】先对每个样本的负梯度应用ReLU，再求平均值
-#     gradient_penalties = tf.nn.relu(-gradients)
+#     # 计算批次内的平均梯度
+#     batch_mean_gradient = tf.reduce_mean(gradients)
     
-#     # 返回批次内所有惩罚的平均值
-#     return tf.reduce_mean(gradient_penalties)
+#     # ReLU函数：如果平均梯度为负（违反物理直觉），则施加惩罚
+#     gradient_penalty = tf.nn.relu(-batch_mean_gradient)
+    
+#     return gradient_penalty
+
+def gradient_constraint_loss(model, features, predictions):
+    """
+    梯度约束损失函数 - 【更新为“逐样本硬约束”】
+    强制模型学习符合物理直觉的"流量-延迟"正相关关系
+    
+    根据新公式: L_gradient = E_batch[ReLU(-gk)] = mean(max(0, -gk))
+    """
+    traffic = features['traffic']
+    
+    if predictions.shape[1] != 2:
+        return tf.constant(0.0, dtype=tf.float32)
+    
+    with tf.GradientTape() as grad_tape:
+        grad_tape.watch(traffic)
+        pred_with_grad = model(features, training=True)
+        loc = pred_with_grad[:, 0]
+    
+    gradients = grad_tape.gradient(loc, traffic)
+    
+    if gradients is None:
+        return tf.constant(0.0, dtype=tf.float32)
+    
+    # 【核心修改】先对每个样本的负梯度应用ReLU，再求平均值
+    gradient_penalties = tf.nn.relu(-gradients)
+    
+    # 返回批次内所有惩罚的平均值
+    return tf.reduce_mean(gradient_penalties)
 
 def heteroscedastic_loss(y_true, y_pred):
     """异方差损失函数 - 用于延迟预测
