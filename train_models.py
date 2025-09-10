@@ -30,6 +30,10 @@ class ModelTrainer:
         
         # 模型类型和物理限制组合
         model_configs = [
+            # 不使用物理约束的配置
+            {"type": "mlp", "use_kan": False, "physics": "none", "use_physics_loss": False, "use_hard_constraint": False},
+            {"type": "kan", "use_kan": True, "physics": "none", "use_physics_loss": False, "use_hard_constraint": False},
+            # 使用物理约束的配置
             {"type": "mlp", "use_kan": False, "physics": "soft", "use_physics_loss": True, "use_hard_constraint": False},
             {"type": "mlp", "use_kan": False, "physics": "hard", "use_physics_loss": True, "use_hard_constraint": True},
             {"type": "kan", "use_kan": True, "physics": "soft", "use_physics_loss": True, "use_hard_constraint": False},
@@ -40,16 +44,31 @@ class ModelTrainer:
         lambda_values = [0.1, 0.5, 1.0]
         
         for model_config in model_configs:
-            for lambda_val in lambda_values:
+            if model_config["use_physics_loss"]:
+                # 使用物理约束的配置：生成多个lambda值
+                for lambda_val in lambda_values:
+                    config = {
+                        "name": f"{model_config['type']}_{model_config['physics']}_{lambda_val}",
+                        "model_type": model_config["type"],
+                        "use_kan": model_config["use_kan"],
+                        "physics_type": model_config["physics"],
+                        "use_physics_loss": model_config["use_physics_loss"],
+                        "use_hard_constraint": model_config["use_hard_constraint"],
+                        "lambda_physics": lambda_val,
+                        "model_dir": self._get_model_dir(model_config, lambda_val),
+                    }
+                    configs.append(config)
+            else:
+                # 不使用物理约束的配置：只生成一个配置
                 config = {
-                    "name": f"{model_config['type']}_{model_config['physics']}_{lambda_val}",
+                    "name": f"{model_config['type']}_{model_config['physics']}",
                     "model_type": model_config["type"],
                     "use_kan": model_config["use_kan"],
                     "physics_type": model_config["physics"],
                     "use_physics_loss": model_config["use_physics_loss"],
                     "use_hard_constraint": model_config["use_hard_constraint"],
-                    "lambda_physics": lambda_val,
-                    "model_dir": self._get_model_dir(model_config, lambda_val),
+                    "lambda_physics": 0.0,  # 不使用物理约束时lambda值无意义
+                    "model_dir": self._get_model_dir(model_config, None),
                 }
                 configs.append(config)
         
@@ -58,8 +77,12 @@ class ModelTrainer:
     def _get_model_dir(self, model_config, lambda_val):
         """生成模型保存目录 - 优化后的简洁结构"""
         # 使用 fixed_model 作为根目录
-        # 目录结构: fixed_model/{model_type}_{physics_type}_{lambda_val}/
-        model_dir = self.models_base_dir / f"{model_config['type']}_{model_config['physics']}_{lambda_val}"
+        if lambda_val is None:
+            # 不使用物理约束的情况
+            model_dir = self.models_base_dir / f"{model_config['type']}_{model_config['physics']}"
+        else:
+            # 使用物理约束的情况
+            model_dir = self.models_base_dir / f"{model_config['type']}_{model_config['physics']}_{lambda_val}"
         return model_dir
     
     def _build_training_command(self, config):
@@ -79,12 +102,13 @@ class ModelTrainer:
             # "--early_stopping_patience", "15",  # 添加早停
         ]
         
-        # 添加物理损失相关参数
-        cmd.extend(["--physics_loss", "--lambda_physics", str(config["lambda_physics"])])
-        
-        # 添加约束类型参数
-        if config["use_hard_constraint"]:
-            cmd.append("--hard_physics")
+        # 添加物理损失相关参数（仅在使用物理约束时）
+        if config["use_physics_loss"]:
+            cmd.extend(["--physics_loss", "--lambda_physics", str(config["lambda_physics"])])
+            
+            # 添加约束类型参数
+            if config["use_hard_constraint"]:
+                cmd.append("--hard_physics")
             
         # 添加KAN相关参数
         if config["use_kan"]:
@@ -112,40 +136,67 @@ class ModelTrainer:
         start_time = time.time()
         
         try:
-            # 执行训练
-            result = subprocess.run(
+            # 执行训练 - 使用实时输出显示训练进度
+            print(f"📊 开始训练，实时输出如下：")
+            print(f"{'='*60}")
+            
+            process = subprocess.Popen(
                 cmd,
                 cwd=str(self.base_dir),
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                timeout=7200  # 2小时超时
+                bufsize=1,
+                universal_newlines=True
             )
             
+            # 实时打印输出
+            output_lines = []
+            while True:
+                output = process.stdout.readline()
+                if output == '' and process.poll() is not None:
+                    break
+                if output:
+                    print(output.strip())
+                    output_lines.append(output)
+            
+            process.wait()
             end_time = time.time()
             duration = end_time - start_time
             
-            if result.returncode == 0:
+            full_output = ''.join(output_lines)
+            
+            if process.returncode == 0:
+                print(f"{'='*60}")
                 print(f"✅ 训练成功完成!")
                 print(f"⏱️  训练耗时: {duration:.1f}秒 ({duration/60:.1f}分钟)")
                 
                 # 保存训练结果
-                self._save_training_result(config, True, duration, result.stdout, result.stderr)
+                self._save_training_result(config, True, duration, full_output, "")
                 return True
             else:
+                print(f"{'='*60}")
                 print(f"❌ 训练失败!")
-                print(f"💬 错误信息: {result.stderr}")
+                print(f"💬 返回码: {process.returncode}")
                 
                 # 保存训练结果
-                self._save_training_result(config, False, duration, result.stdout, result.stderr)
+                self._save_training_result(config, False, duration, full_output, f"Process returned {process.returncode}")
                 return False
                 
-        except subprocess.TimeoutExpired:
-            print(f"⏰ 训练超时 (2小时)")
-            self._save_training_result(config, False, 7200, "", "训练超时")
+        except KeyboardInterrupt:
+            print(f"{'='*60}")
+            print(f"🛑 训练被用户中断")
+            if 'process' in locals():
+                process.terminate()
+                process.wait()
+            duration = time.time() - start_time
+            self._save_training_result(config, False, duration, "", "用户中断")
             return False
         except Exception as e:
+            print(f"{'='*60}")
             print(f"💥 训练异常: {e}")
-            self._save_training_result(config, False, 0, "", str(e))
+            duration = time.time() - start_time
+            self._save_training_result(config, False, duration, "", str(e))
             return False
     
     def _save_training_result(self, config, success, duration, stdout, stderr):

@@ -1,13 +1,47 @@
 # net2vec
 
-This repository is a collection of machine learning models for computer networks.
+This repository is a collection of machine learning models for computer networks with comprehensive training automation and experiment management.
+
 Currently, the following models are implemented:
 
 1. [Message Passing](mpnn) - vanilla Graph Neural Network
 1. [RouteNet](routenet) - A new neural architecture designed for neural understanding of routing in the network.
-1. **RouteNet TensorFlow 2** - Modern TensorFlow 2.x implementation with TensorBoard support and evaluation tools
+1. **RouteNet TensorFlow 2** - Modern TensorFlow 2.x implementation with physics constraints, KAN architectures, and automated training
+
+## 🌟 Key Features
+
+- **🧠 Multiple Architectures**: Traditional MLP vs Kolmogorov-Arnold Networks (KAN)
+- **⚡ Physics Constraints**: Soft and hard physics constraint implementations  
+- **🤖 Automated Training**: Systematic training across 14 different model configurations
+- **📊 Comprehensive Evaluation**: Automated experiment management and comparison
+- **📈 Real-time Monitoring**: Live training progress and TensorBoard integration
+- **🔧 Modern TF2**: Keras APIs, eager execution, and best practices
 
 **If you decide to apply the concepts presented or base on the provided code, please do refer our related paper**
+
+## 🚀 Quick Start
+
+**For automated training of all model configurations:**
+```bash
+# Install dependencies
+pip install tensorflow tqdm numpy matplotlib seaborn
+
+# Train all 14 model configurations (MLP/KAN × No/Soft/Hard physics)
+python train_models.py
+
+# Models will be saved to fixed_model/ with descriptive names
+```
+
+**For single model training:**
+```bash
+# Train a specific RouteNet configuration
+python routenet/routenet_tf2.py \
+    --train_dir data/routenet/nsfnetbw/tfrecords/train/ \
+    --eval_dir data/routenet/nsfnetbw/tfrecords/evaluate/ \
+    --model_dir models/custom_model \
+    --target delay \
+    --epochs 20
+```
 
 ## RouteNet TensorFlow 2 Implementation
 
@@ -100,19 +134,127 @@ The evaluation script provides comprehensive metrics:
 - **MAPE (Mean Absolute Percentage Error)**: Average relative error percentage
 - **Relative Error Statistics**: Mean, standard deviation, and 95th percentile
 
-### 🔄 Typical Workflow
+### 🔄 Typical Workflows
 
+#### **Option 1: Single Model Training**
 1. **Prepare Data**: Ensure TFRecord files are in the correct format
-2. **Train Model**: Use `routenet_tf2.py` to train the network
+2. **Train Model**: Use `routenet_tf2.py` to train a specific configuration
 3. **Monitor Progress**: Use TensorBoard to track training
 4. **Evaluate Results**: Use `evaluate_routenet.py` to assess performance
-5. **Analyze Results**: Review generated plots and metrics
+
+#### **Option 2: Comprehensive Model Comparison**
+1. **Prepare Data**: Ensure TFRecord files are in the correct format
+2. **Automated Training**: Use `train_models.py` to train all 14 model configurations
+3. **Monitor Progress**: Real-time epoch progress for each model
+4. **Systematic Evaluation**: Use experiment automation for comprehensive comparison
+5. **Analysis**: Review comparative results across architectures and constraints
+
+#### **Option 3: Custom Experiment Design**
+1. **Configure Experiments**: Modify `experiment_config.yaml` for specific comparisons
+2. **Selective Training**: Train specific model subsets using `train_models.py`
+3. **Automated Evaluation**: Run experiment automation for systematic analysis
+4. **Results Analysis**: Generate comparative reports and visualizations
+
+## 🤖 Automated Training System
+
+### Systematic Model Training with `train_models.py`
+
+The `train_models.py` script provides automated training for comprehensive model comparison across different architectures and physics constraints:
+
+```bash
+python train_models.py
+```
+
+**Training Configurations (14 models total):**
+
+1. **MLP-based models** (7 configurations):
+   - No physics constraints with λ ∈ {0}
+   - Soft physics constraints with λ ∈ {0.001, 0.01, 0.1}
+   - Hard physics constraints with λ ∈ {0.001, 0.01, 0.1}
+
+2. **KAN-based models** (7 configurations):
+   - No physics constraints with λ ∈ {0}
+   - Soft physics constraints with λ ∈ {0.001, 0.01, 0.1}
+   - Hard physics constraints with λ ∈ {0.001, 0.01, 0.1}
+
+**Features:**
+- ✅ **Real-time Progress**: Live epoch progress output during training
+- ✅ **Organized Storage**: Models saved to `fixed_model/` with descriptive names
+- ✅ **Complete Coverage**: Tests all architecture and constraint combinations
+- ✅ **Robust Training**: Handles interruptions and errors gracefully
+
+**Model Directory Structure:**
+```
+fixed_model/
+├── mlp_no_physics_lambda_0/
+├── mlp_soft_physics_lambda_0.001/
+├── mlp_soft_physics_lambda_0.01/
+├── mlp_soft_physics_lambda_0.1/
+├── mlp_hard_physics_lambda_0.001/
+├── mlp_hard_physics_lambda_0.01/
+├── mlp_hard_physics_lambda_0.1/
+├── kan_no_physics_lambda_0/
+├── kan_soft_physics_lambda_0.001/
+├── kan_soft_physics_lambda_0.01/
+├── kan_soft_physics_lambda_0.1/
+├── kan_hard_physics_lambda_0.001/
+├── kan_hard_physics_lambda_0.01/
+└── kan_hard_physics_lambda_0.1/
+```
+
+### Physics Constraints Explained
+
+**Physics Constraint Types:**
+- **No Physics**: Traditional neural network training (λ = 0)
+- **Soft Physics**: Batch-averaged gradient constraints (gradual enforcement)
+- **Hard Physics**: Per-sample gradient constraints (strict enforcement)
+
+**Lambda Values:**
+- `λ = 0.001`: Weak constraint influence
+- `λ = 0.01`: Moderate constraint influence  
+- `λ = 0.1`: Strong constraint influence
+
+## 🔬 Experiment Automation with YAML Configuration
+
+### Automated Evaluation with `experiment_config.yaml`
+
+The experiment automation system enables systematic model evaluation across multiple configurations:
+
+```bash
+# Run automated experiment evaluation
+python run_experiments.py experiment_config.yaml
+```
+
+**Configuration Structure:**
+```yaml
+experiments:
+  mlp_soft_0001:
+    model_dir: "fixed_model/mlp_soft_physics_lambda_0.001"
+    architecture: "mlp"
+    physics_constraint: "soft"
+    lambda_value: 0.001
+    
+  kan_hard_01:
+    model_dir: "fixed_model/kan_hard_physics_lambda_0.1" 
+    architecture: "kan"
+    physics_constraint: "hard"
+    lambda_value: 0.1
+```
+
+**Evaluation Outputs:**
+- Performance comparison across all model variants
+- Statistical significance testing
+- Comprehensive visualization of results
+- Automated report generation
 
 ### 💡 Tips and Best Practices
 
+- **Training Duration**: Each model trains for 20 epochs, total ~4-6 hours for all 14 models
 - **Batch Size**: Start with smaller batch sizes (8-16) to reduce memory usage
 - **Epochs**: Monitor validation loss to avoid overfitting
 - **Data Quality**: Ensure TFRecord files contain all required features
 - **GPU Memory**: The model will use GPU automatically if available
 - **Retracing Warnings**: Some TF function retracing is normal due to variable graph sizes
+- **Model Comparison**: Use experiment automation for systematic performance analysis
+- **Physics Constraints**: Start with soft constraints (easier convergence) before hard constraints
 
