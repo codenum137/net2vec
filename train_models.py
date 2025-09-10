@@ -127,17 +127,21 @@ class ModelTrainer:
         # 创建模型目录
         config["model_dir"].mkdir(parents=True, exist_ok=True)
         
+        # 创建日志文件路径
+        log_file = config["model_dir"] / "training.log"
+        
         # 构建训练命令
         cmd = self._build_training_command(config)
         
         print(f"⚡ 执行命令: {' '.join(cmd)}")
         print(f"🕐 开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"📝 日志文件: {log_file}")
         
         start_time = time.time()
         
         try:
-            # 执行训练 - 使用实时输出显示训练进度
-            print(f"📊 开始训练，实时输出如下：")
+            # 执行训练 - 只显示epoch进度，详细输出写入日志
+            print(f"📊 开始训练，监控进度中...")
             print(f"{'='*60}")
             
             process = subprocess.Popen(
@@ -150,19 +154,80 @@ class ModelTrainer:
                 universal_newlines=True
             )
             
-            # 实时打印输出
+            # 监控输出：控制台显示epoch进度，日志文件保存详细输出
             output_lines = []
-            while True:
-                output = process.stdout.readline()
-                if output == '' and process.poll() is not None:
-                    break
-                if output:
-                    print(output.strip())
-                    output_lines.append(output)
+            current_epoch = 0
+            total_epochs = 20  # 从命令中获取的epoch数
+            
+            # 打开日志文件
+            with open(log_file, 'w', encoding='utf-8') as log_f:
+                # 写入日志头部信息
+                log_f.write(f"{'='*80}\n")
+                log_f.write(f"训练开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                log_f.write(f"模型配置: {config['name']}\n")
+                log_f.write(f"执行命令: {' '.join(cmd)}\n")
+                log_f.write(f"{'='*80}\n\n")
+                log_f.flush()
+                
+                while True:
+                    output = process.stdout.readline()
+                    if output == '' and process.poll() is not None:
+                        break
+                    if output:
+                        output_lines.append(output)
+                        
+                        # 写入日志文件（实时）
+                        log_f.write(output)
+                        log_f.flush()
+                        
+                        # 检查是否包含epoch信息
+                        line_lower = output.lower().strip()
+                        if 'epoch' in line_lower:
+                            # 尝试提取epoch数字 - 支持多种格式
+                            import re
+                            # 匹配 "Epoch 1/20", "Epoch: 5", "epoch 10", "Training epoch 3" 等格式
+                            epoch_patterns = [
+                                r'epoch\s*(\d+)(?:/\d+)?',     # Epoch 1/20 或 Epoch 1
+                                r'epoch\s*:?\s*(\d+)',         # Epoch: 5 或 Epoch 5
+                                r'(\d+)/\d+.*epoch',           # 1/20 epoch 格式
+                                r'epoch\s+is\s+(\d+)',         # epoch is 12 格式
+                            ]
+                            
+                            epoch_num = None
+                            for pattern in epoch_patterns:
+                                epoch_match = re.search(pattern, line_lower)
+                                if epoch_match:
+                                    epoch_num = int(epoch_match.group(1))
+                                    break
+                            
+                            if epoch_num and epoch_num != current_epoch:
+                                current_epoch = epoch_num
+                                progress = (current_epoch / total_epochs) * 100
+                                progress_msg = f"📈 训练进度: Epoch {current_epoch}/{total_epochs} ({progress:.1f}%)"
+                                print(progress_msg)
+                                
+                                # 同时写入日志文件
+                                log_f.write(f"\n[PROGRESS] {progress_msg}\n")
+                                log_f.flush()
+                
+                # 写入日志尾部信息
+                log_f.write(f"\n{'='*80}\n")
+                log_f.write(f"训练结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             
             process.wait()
             end_time = time.time()
             duration = end_time - start_time
+            
+            # 显示最终进度
+            if current_epoch > 0:
+                final_msg = f"📈 训练完成: Epoch {current_epoch}/{total_epochs} (100%)"
+                print(final_msg)
+                
+                # 写入最终状态到日志
+                with open(log_file, 'a', encoding='utf-8') as log_f:
+                    log_f.write(f"\n[FINAL] {final_msg}\n")
+                    log_f.write(f"训练耗时: {duration:.1f}秒 ({duration/60:.1f}分钟)\n")
+                    log_f.write(f"{'='*80}\n")
             
             full_output = ''.join(output_lines)
             
@@ -170,6 +235,12 @@ class ModelTrainer:
                 print(f"{'='*60}")
                 print(f"✅ 训练成功完成!")
                 print(f"⏱️  训练耗时: {duration:.1f}秒 ({duration/60:.1f}分钟)")
+                print(f"📝 详细日志: {log_file}")
+                
+                # 写入成功状态到日志
+                with open(log_file, 'a', encoding='utf-8') as log_f:
+                    log_f.write(f"\n[SUCCESS] 训练成功完成!\n")
+                    log_f.write(f"返回码: {process.returncode}\n")
                 
                 # 保存训练结果
                 self._save_training_result(config, True, duration, full_output, "")
@@ -178,6 +249,12 @@ class ModelTrainer:
                 print(f"{'='*60}")
                 print(f"❌ 训练失败!")
                 print(f"💬 返回码: {process.returncode}")
+                print(f"📝 详细日志: {log_file}")
+                
+                # 写入失败状态到日志
+                with open(log_file, 'a', encoding='utf-8') as log_f:
+                    log_f.write(f"\n[ERROR] 训练失败!\n")
+                    log_f.write(f"返回码: {process.returncode}\n")
                 
                 # 保存训练结果
                 self._save_training_result(config, False, duration, full_output, f"Process returned {process.returncode}")
@@ -186,16 +263,38 @@ class ModelTrainer:
         except KeyboardInterrupt:
             print(f"{'='*60}")
             print(f"🛑 训练被用户中断")
+            print(f"📝 详细日志: {log_file}")
             if 'process' in locals():
                 process.terminate()
                 process.wait()
             duration = time.time() - start_time
+            
+            # 写入中断状态到日志
+            try:
+                with open(log_file, 'a', encoding='utf-8') as log_f:
+                    log_f.write(f"\n[INTERRUPTED] 训练被用户中断\n")
+                    log_f.write(f"中断时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    log_f.write(f"已运行时间: {duration:.1f}秒\n")
+            except:
+                pass
+            
             self._save_training_result(config, False, duration, "", "用户中断")
             return False
         except Exception as e:
             print(f"{'='*60}")
             print(f"💥 训练异常: {e}")
+            print(f"📝 详细日志: {log_file}")
             duration = time.time() - start_time
+            
+            # 写入异常状态到日志
+            try:
+                with open(log_file, 'a', encoding='utf-8') as log_f:
+                    log_f.write(f"\n[EXCEPTION] 训练异常: {e}\n")
+                    log_f.write(f"异常时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    log_f.write(f"已运行时间: {duration:.1f}秒\n")
+            except:
+                pass
+            
             self._save_training_result(config, False, duration, "", str(e))
             return False
     

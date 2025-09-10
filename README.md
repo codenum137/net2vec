@@ -178,7 +178,8 @@ python train_models.py
    - Hard physics constraints with λ ∈ {0.001, 0.01, 0.1}
 
 **Features:**
-- ✅ **Real-time Progress**: Live epoch progress output during training
+- ✅ **Epoch Progress Tracking**: Shows current epoch and percentage progress only
+- ✅ **Detailed Logging**: Full training output saved to individual log files
 - ✅ **Organized Storage**: Models saved to `fixed_model/` with descriptive names
 - ✅ **Complete Coverage**: Tests all architecture and constraint combinations
 - ✅ **Robust Training**: Handles interruptions and errors gracefully
@@ -187,7 +188,13 @@ python train_models.py
 ```
 fixed_model/
 ├── mlp_no_physics_lambda_0/
+│   ├── training.log              # 完整训练日志
+│   ├── best_delay_model.weights.h5
+│   └── logs/                     # TensorBoard日志
 ├── mlp_soft_physics_lambda_0.001/
+│   ├── training.log
+│   ├── best_delay_model.weights.h5
+│   └── logs/
 ├── mlp_soft_physics_lambda_0.01/
 ├── mlp_soft_physics_lambda_0.1/
 ├── mlp_hard_physics_lambda_0.001/
@@ -200,6 +207,35 @@ fixed_model/
 ├── kan_hard_physics_lambda_0.001/
 ├── kan_hard_physics_lambda_0.01/
 └── kan_hard_physics_lambda_0.1/
+```
+
+### Training Logs
+
+Each model generates a detailed `training.log` file containing:
+
+- **📋 Training Configuration**: Model type, physics constraints, parameters
+- **⚡ Execution Command**: Full command used for training
+- **📊 Complete Output**: All TensorFlow/Keras training output
+- **📈 Progress Markers**: Epoch progress with timestamps
+- **✅ Final Results**: Success/failure status and timing
+- **🔍 Error Details**: Exception information if training fails
+
+**Log File Format:**
+```log
+================================================================================
+训练开始时间: 2025-09-10 12:14:56
+模型配置: mlp_soft_physics_lambda_0.001
+执行命令: python routenet/routenet_tf2.py --train_dir ...
+================================================================================
+
+Loading training data...
+Epoch 1/20
+100/100 [==============================] - 15s - loss: 0.1234 - val_loss: 0.0987
+
+[PROGRESS] 📈 训练进度: Epoch 1/20 (5.0%)
+...
+
+[SUCCESS] 训练成功完成!
 ```
 
 ### Physics Constraints Explained
