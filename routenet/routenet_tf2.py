@@ -236,6 +236,13 @@ class RouteNet(tf.keras.Model):
         # 消息传递层（与原版保持一致的命名）
         self.link_update = tf.keras.layers.GRUCell(config['link_state_dim'])  # 原版中叫 edge_update
         self.path_update = tf.keras.layers.GRUCell(config['path_state_dim'])
+        
+        # 【修复1: 在__init__中创建RNN层，避免在循环中重复创建】
+        self.rnn_layer = tf.keras.layers.RNN(
+            self.path_update, 
+            return_sequences=True, 
+            return_state=True
+        )
 
         # 读出网络 - 根据use_kan参数选择MLP或KAN
         if use_kan:
@@ -250,13 +257,20 @@ class RouteNet(tf.keras.Model):
             ])
         else:
             print("Using traditional MLP for readout layers")
-            self.readout = tf.keras.Sequential([
-                tf.keras.layers.Dense(
-                    config['readout_units'],
-                    activation='selu',
-                    kernel_regularizer=tf.keras.regularizers.l2(config['l2'])
-                ) for _ in range(config['readout_layers'])
-            ])
+            # 【修复2: 在MLP版本中添加Dropout层】
+            readout_layers = []
+            for _ in range(config['readout_layers']):
+                readout_layers.append(
+                    tf.keras.layers.Dense(
+                        config['readout_units'],
+                        activation='selu',
+                        kernel_regularizer=tf.keras.regularizers.l2(config['l2'])
+                    )
+                )
+                # 添加Dropout层，使用与原版一致的dropout_rate
+                readout_layers.append(tf.keras.layers.Dropout(rate=0.5))  # 原版默认dropout_rate=0.5
+                
+            self.readout = tf.keras.Sequential(readout_layers)
         
         # 最终输出层，支持不同的激活函数
         self.final_layer = tf.keras.layers.Dense(
@@ -307,16 +321,9 @@ class RouteNet(tf.keras.Model):
             # 创建 mask: True 表示有效位置，False 表示 padding
             mask = tf.sequence_mask(lens, maxlen=max_len, dtype=tf.bool)
             
-            # 使用 Keras RNN 而不是已弃用的 dynamic_rnn
-            # 创建 RNN 层
-            rnn_layer = tf.keras.layers.RNN(
-                self.path_update, 
-                return_sequences=True, 
-                return_state=True
-            )
-            
+            # 【修复: 使用预先创建的RNN层，而不是在循环中重复创建】
             # RNN 前向传播
-            outputs, path_state = rnn_layer(
+            outputs, path_state = self.rnn_layer(
                 link_inputs, 
                 initial_state=path_state, 
                 mask=mask,
@@ -341,47 +348,19 @@ class RouteNet(tf.keras.Model):
 # 3. 损失函数 (支持延迟和丢包两种任务 + 物理约束)
 # ==============================================================================
 
-# def gradient_constraint_loss(model, features, predictions):
-#     """
-#     梯度约束损失函数 - 期望值梯度约束损失
-#     强制模型学习符合物理直觉的"流量-延迟"正相关关系
-    
-#     根据公式: L_gradient = ReLU(-E_batch[gk]) = max(0, -1/|batch| * sum(gk))
-#     其中 gk = ∂loc_k/∂T_k 是自影响梯度
-#     """
-#     traffic = features['traffic']
-    
-#     # 只处理延迟预测任务
-#     if predictions.shape[1] != 2:
-#         return tf.constant(0.0, dtype=tf.float32)
-    
-#     with tf.GradientTape() as grad_tape:
-#         grad_tape.watch(traffic)
-#         # 重新前向传播计算预测值
-#         pred_with_grad = model(features, training=True)
-#         # 延迟预测的期望值（loc参数）
-#         loc = pred_with_grad[:, 0]
-    
-#     # 计算自影响梯度: ∂loc_k/∂T_k
-#     gradients = grad_tape.gradient(loc, traffic)
-    
-#     if gradients is None:
-#         return tf.constant(0.0, dtype=tf.float32)
-    
-#     # 计算批次内的平均梯度
-#     batch_mean_gradient = tf.reduce_mean(gradients)
-    
-#     # ReLU函数：如果平均梯度为负（违反物理直觉），则施加惩罚
-#     gradient_penalty = tf.nn.relu(-batch_mean_gradient)
-    
-#     return gradient_penalty
-
-def gradient_constraint_loss(model, features, predictions):
+def gradient_constraint_loss(model, features, predictions, use_hard_constraint=True):
     """
-    梯度约束损失函数 - 【更新为“逐样本硬约束”】
+    梯度约束损失函数 - 支持软约束和硬约束
     强制模型学习符合物理直觉的"流量-延迟"正相关关系
     
-    根据新公式: L_gradient = E_batch[ReLU(-gk)] = mean(max(0, -gk))
+    Args:
+        model: 模型实例
+        features: 输入特征
+        predictions: 模型预测
+        use_hard_constraint: True为硬约束(逐样本), False为软约束(批次平均)
+    
+    软约束公式: L_gradient = ReLU(-E_batch[gk]) = max(0, -1/|batch| * sum(gk))
+    硬约束公式: L_gradient = E_batch[ReLU(-gk)] = mean(max(0, -gk))
     """
     traffic = features['traffic']
     
@@ -398,11 +377,17 @@ def gradient_constraint_loss(model, features, predictions):
     if gradients is None:
         return tf.constant(0.0, dtype=tf.float32)
     
-    # 【核心修改】先对每个样本的负梯度应用ReLU，再求平均值
-    gradient_penalties = tf.nn.relu(-gradients)
-    
-    # 返回批次内所有惩罚的平均值
-    return tf.reduce_mean(gradient_penalties)
+    if use_hard_constraint:
+        # 硬约束：先对每个样本的负梯度应用ReLU，再求平均值
+        # L_gradient = E_batch[ReLU(-gk)] = mean(max(0, -gk))
+        gradient_penalties = tf.nn.relu(-gradients)
+        return tf.reduce_mean(gradient_penalties)
+    else:
+        # 软约束：计算批次内的平均梯度，然后应用ReLU
+        # L_gradient = ReLU(-E_batch[gk]) = max(0, -1/|batch| * sum(gk))
+        batch_mean_gradient = tf.reduce_mean(gradients)
+        gradient_penalty = tf.nn.relu(-batch_mean_gradient)
+        return gradient_penalty
 
 def heteroscedastic_loss(y_true, y_pred):
     """异方差损失函数 - 用于延迟预测
@@ -460,7 +445,7 @@ def binomial_loss(y_true, y_pred):
     
     return loss
 
-def physics_informed_loss(y_true, y_pred, model, features, lambda_physics=0.1):
+def physics_informed_loss(y_true, y_pred, model, features, lambda_physics=0.1, use_hard_constraint=True):
     """
     物理约束损失函数 (Physics-Informed Loss Function)
     
@@ -475,19 +460,20 @@ def physics_informed_loss(y_true, y_pred, model, features, lambda_physics=0.1):
         model: 模型实例（用于计算梯度）
         features: 输入特征（包含traffic）
         lambda_physics: 物理约束权重系数
+        use_hard_constraint: True为硬约束，False为软约束
     """
     # 数据拟合项：异方差损失
     l_hetero = heteroscedastic_loss(y_true, y_pred)
     
     # 物理约束项：梯度约束损失
-    l_gradient = gradient_constraint_loss(model, features, y_pred)
+    l_gradient = gradient_constraint_loss(model, features, y_pred, use_hard_constraint)
     
     # 总损失
     l_total = l_hetero + lambda_physics * l_gradient
     
     return l_total, l_hetero, l_gradient
 
-def create_model_and_loss_fn(config, target, use_kan=False, use_physics_loss=False, lambda_physics=0.1):
+def create_model_and_loss_fn(config, target, use_kan=False, use_physics_loss=False, use_hard_constraint=True, lambda_physics=0.1):
     """根据target参数创建相应的模型和损失函数
     
     Args:
@@ -495,10 +481,16 @@ def create_model_and_loss_fn(config, target, use_kan=False, use_physics_loss=Fal
         target: 预测目标 ('delay' 或 'drops')
         use_kan: 是否使用KAN架构
         use_physics_loss: 是否使用物理约束损失函数
+        use_hard_constraint: True为硬约束(逐样本)，False为软约束(批次平均)
         lambda_physics: 物理约束权重系数
     """
     model_type = "KAN-based" if use_kan else "MLP-based"
-    loss_type = "physics-informed" if use_physics_loss else "standard"
+    
+    # 确定约束类型
+    if use_physics_loss:
+        constraint_type = "hard-constraint" if use_hard_constraint else "soft-constraint"
+    else:
+        constraint_type = "standard"
     
     if target == 'delay':
         # 延迟预测模型
@@ -510,20 +502,21 @@ def create_model_and_loss_fn(config, target, use_kan=False, use_physics_loss=Fal
                 if features is None:
                     # 如果没有features，退回到标准异方差损失
                     return heteroscedastic_loss(labels, predictions)
-                return physics_informed_loss(labels, predictions, model, features, lambda_physics)
+                return physics_informed_loss(labels, predictions, model, features, lambda_physics, use_hard_constraint)
+            print("Created {} delay prediction model with {} (λ={})".format(
+                model_type, constraint_type, lambda_physics))
         else:
             # 使用标准异方差损失
             loss_fn = heteroscedastic_loss
-            
-        print("Created {} delay prediction model with {} heteroscedastic loss (λ={})".format(
-            model_type, loss_type, lambda_physics if use_physics_loss else "N/A"))
+            print("Created {} delay prediction model with {} loss".format(
+                model_type, constraint_type))
             
     elif target == 'drops':
-        # 丢包预测模型 - 暂不支持物理约束
+        # 丢包预测模型
         model = RouteNet(config, output_units=1, final_activation=None, use_kan=use_kan)
         loss_fn = binomial_loss
         if use_physics_loss:
-            print("Warning: Physics-informed loss is not implemented for drops prediction. Using standard binomial loss.")
+            print("Warning: Physics constraints are not implemented for drops prediction. Using standard binomial loss.")
         print("Created {} drop prediction model with binomial loss".format(model_type))
     else:
         raise ValueError("Unsupported target: {}. Choose 'delay' or 'drops'".format(target))
@@ -617,6 +610,7 @@ def main(args):
     model, loss_fn = create_model_and_loss_fn(config, args.target, 
                                              use_kan=args.kan, 
                                              use_physics_loss=args.physics_loss,
+                                             use_hard_constraint=args.hard_physics,
                                              lambda_physics=args.lambda_physics)
     
     # 创建动态学习率调度器
@@ -841,6 +835,8 @@ if __name__ == '__main__':
     # 物理约束损失参数
     parser.add_argument('--physics_loss', action='store_true',
                       help='Enable physics-informed loss function for delay prediction')
+    parser.add_argument('--hard_physics', action='store_true',
+                      help='Use hard constraint (per-sample) instead of soft constraint (batch-average). Only effective when --physics_loss is enabled.')
     parser.add_argument('--lambda_physics', type=float, default=0.1,
                       help='Weight coefficient for physics constraint term (default: 0.1)')
     

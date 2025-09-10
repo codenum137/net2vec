@@ -14,7 +14,7 @@ global_settings:
   # 梯度验证参数
   traffic_min: 0.1
   traffic_max: 1.0
-  num_points: 10
+  num_points: 20
   
   # 输出根目录
   base_output_dir: "experiment_results"

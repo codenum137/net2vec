@@ -106,3 +106,4 @@ models/
 test/
 result/
 experiment_results
+fixed_model/
