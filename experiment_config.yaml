@@ -1,0 +1,128 @@
+# 实验配置文件
+# 定义所有模型组合和实验参数
+
+# 全局设置
+global_settings:
+  # 数据路径
+  nsfnet_test_dir: "data/routenet/nsfnetbw/tfrecords/evaluate"
+  gbn_test_dir: "data/routenet/gbnbw/tfrecords/evaluate"
+  
+  # 实验参数
+  batch_size: 32
+  num_samples: 1000
+  
+  # 梯度验证参数
+  traffic_min: 0.1
+  traffic_max: 1.0
+  num_points: 10
+  
+  # 输出根目录
+  base_output_dir: "experiment_results"
+
+# 模型配置
+models:
+  # KAN模型 - 软约束
+  kan_soft_0.1:
+    model_type: "kan"
+    physics_type: "soft"
+    lambda_physics: 0.1
+    delay_model_dir: "models/routenet_tf2_physics_model/kan/delay/lambda_physics_0.1"
+    use_kan: true
+
+    
+  kan_soft_1.0:
+    model_type: "kan"
+    physics_type: "soft"
+    lambda_physics: 1.0
+    delay_model_dir: "models/routenet_tf2_physics_model/kan/delay/lambda_physics_1"
+    use_kan: true
+    
+    
+  # KAN模型 - 硬约束
+  kan_hard_0.1:
+    model_type: "kan"
+    physics_type: "hard"
+    lambda_physics: 0.1
+    delay_model_dir: "models/routenet_tf2_hard_physics_model/kan/delay/lambda_physics_0.1"
+    use_kan: true
+    
+    
+  kan_hard_1.0:
+    model_type: "kan"
+    physics_type: "hard"
+    lambda_physics: 1.0
+    delay_model_dir: "models/routenet_tf2_hard_physics_model/kan/delay/lambda_physics_1"
+    use_kan: true
+    
+    
+  # MLP模型 - 软约束
+  mlp_soft_0.1:
+    model_type: "mlp"
+    physics_type: "soft"
+    lambda_physics: 0.1
+    delay_model_dir: "models/routenet_tf2_physics_model/mlp/delay/lambda_physics_0.1"
+    use_kan: false
+    
+    
+  mlp_soft_1.0:
+    model_type: "mlp"
+    physics_type: "soft"
+    lambda_physics: 1.0
+    delay_model_dir: "models/routenet_tf2_physics_model/mlp/delay/lambda_physics_1"
+    use_kan: false
+    
+    
+  # MLP模型 - 硬约束
+  mlp_hard_0.1:
+    model_type: "mlp"
+    physics_type: "hard"
+    lambda_physics: 0.1
+    delay_model_dir: "models/routenet_tf2_hard_physics_model/mlp/delay/lambda_physics_0.1"
+    use_kan: false
+    
+    
+  mlp_hard_1.0:
+    model_type: "mlp"
+    physics_type: "hard"
+    lambda_physics: 1.0
+    delay_model_dir: "models/routenet_tf2_hard_physics_model/mlp/delay/lambda_physics_1"
+    use_kan: false
+    
+
+# 实验定义
+experiments:
+  evaluate:
+    script: "routenet/evaluate_routenet_tf2.py"
+    required_args:
+      - "delay_model_dir"
+      - "nsfnet_test_dir" 
+      - "gbn_test_dir"
+      - "output_dir"
+    optional_args:
+      - "batch_size"
+      - "num_samples"
+      - "kan"
+      
+  gradient:
+    script: "routenet/gradient_sanity_check.py"
+    required_args:
+      - "model_dir"
+      - "output_dir"
+    optional_args:
+      - "use_kan"
+      - "target"
+      - "traffic_min"
+      - "traffic_max"
+      - "num_points"
+      
+  numerical:
+    script: "routenet/numerical_analysis.py"
+    required_args:
+      - "model_dir"
+      - "nsfnet_test_dir"
+      - "gbn_test_dir"
+      - "output_dir"
+    optional_args:
+      - "batch_size"
+      - "num_samples"
+      - "kan"
