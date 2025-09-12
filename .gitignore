@@ -105,5 +105,7 @@ data/
 models/
 test/
 result/
-experiment_results
+experiment_results/
 fixed_model/
+training_logs/
+

@@ -14,12 +14,13 @@ from pathlib import Path
 import argparse
 
 class ModelTrainer:
-    def __init__(self, base_dir="/home/ubantu/net2vec"):
+    def __init__(self, base_dir="/home/ubantu/net2vec", force_retrain=False):
         self.base_dir = Path(base_dir)
         self.train_script = self.base_dir / "routenet" / "routenet_tf2.py"
         self.train_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "train"
         self.eval_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "evaluate"
         self.models_base_dir = self.base_dir / "fixed_model"
+        self.force_retrain = force_retrain  # 是否强制重新训练已存在的模型
         
         # 训练配置
         self.training_configs = self._generate_training_configs()
@@ -41,7 +42,7 @@ class ModelTrainer:
         ]
         
         # lambda_physics参数
-        lambda_values = [0.1, 0.5, 1.0]
+        lambda_values = [0.1, 1.0]
         
         for model_config in model_configs:
             if model_config["use_physics_loss"]:
@@ -97,9 +98,8 @@ class ModelTrainer:
             "--batch_size", "32",
             "--lr_schedule", "plateau",
             "--learning_rate", "0.001",
-            # "--plateau_patience", "8",  # 增加耐心值
+            "--plateau_patience", "8",  # 增加耐心值
             "--plateau_factor", "0.5",
-            # "--early_stopping_patience", "15",  # 添加早停
         ]
         
         # 添加物理损失相关参数（仅在使用物理约束时）
@@ -112,7 +112,7 @@ class ModelTrainer:
             
         # 添加KAN相关参数
         if config["use_kan"]:
-            cmd.append("--use_kan")
+            cmd.append("--kan")  # 修正参数名：使用 --kan 而不是 --use_kan
             
         return cmd
     
@@ -123,6 +123,14 @@ class ModelTrainer:
         print(f"📁 模型目录: {config['model_dir']}")
         print(f"⚙️  配置: {config['model_type'].upper()}, {config['physics_type']}, λ={config['lambda_physics']}")
         print(f"{'='*60}")
+        
+        # 检查模型是否已存在
+        model_file = config["model_dir"] / "best_delay_model.weights.h5"
+        if model_file.exists() and not self.force_retrain:
+            print(f"⏭️  模型已存在，跳过训练: {model_file}")
+            print(f"💡 如需重新训练，请使用 --force 参数")
+            print(f"{'='*60}")
+            return True
         
         # 创建模型目录
         config["model_dir"].mkdir(parents=True, exist_ok=True)
@@ -398,14 +406,21 @@ def main():
     parser.add_argument("--start-from", type=str, help="从指定模型开始训练")
     parser.add_argument("--models", nargs="+", help="仅训练指定的模型")
     parser.add_argument("--base-dir", default="/home/ubantu/net2vec", help="项目根目录")
+    parser.add_argument("--force", action="store_true", help="强制重新训练已存在的模型")
     
     args = parser.parse_args()
     
-    trainer = ModelTrainer(base_dir=args.base_dir)
+    trainer = ModelTrainer(base_dir=args.base_dir, force_retrain=args.force)
     
     if args.list:
         trainer.list_configs()
         return
+    
+    # 显示训练模式
+    if args.force:
+        print("🔄 强制重新训练模式：将覆盖已存在的模型")
+    else:
+        print("⏭️  跳过模式：已存在的模型将被跳过")
     
     # 确认开始训练
     if not args.models and not args.start_from:

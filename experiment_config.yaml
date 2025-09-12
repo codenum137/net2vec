@@ -21,72 +21,80 @@ global_settings:
 
 # 模型配置
 models:
-  # KAN模型 - 软约束
-  kan_soft_0.1:
+  # 无物理约束基线模型
+  mlp_none:
+    model_type: "mlp"
+    physics_type: "none"
+    lambda_physics: 0.0
+    delay_model_dir: "fixed_model/mlp_none"
+    use_kan: false
+
+  kan_none:
     model_type: "kan"
-    physics_type: "soft"
-    lambda_physics: 0.1
-    delay_model_dir: "models/routenet_tf2_physics_model/kan/delay/lambda_physics_0.1"
+    physics_type: "none"
+    lambda_physics: 0.0
+    delay_model_dir: "fixed_model/kan_none"
     use_kan: true
 
-    
-  kan_soft_1.0:
-    model_type: "kan"
-    physics_type: "soft"
-    lambda_physics: 1.0
-    delay_model_dir: "models/routenet_tf2_physics_model/kan/delay/lambda_physics_1"
-    use_kan: true
-    
-    
-  # KAN模型 - 硬约束
-  kan_hard_0.1:
-    model_type: "kan"
-    physics_type: "hard"
-    lambda_physics: 0.1
-    delay_model_dir: "models/routenet_tf2_hard_physics_model/kan/delay/lambda_physics_0.1"
-    use_kan: true
-    
-    
-  kan_hard_1.0:
-    model_type: "kan"
-    physics_type: "hard"
-    lambda_physics: 1.0
-    delay_model_dir: "models/routenet_tf2_hard_physics_model/kan/delay/lambda_physics_1"
-    use_kan: true
-    
-    
   # MLP模型 - 软约束
   mlp_soft_0.1:
     model_type: "mlp"
     physics_type: "soft"
     lambda_physics: 0.1
-    delay_model_dir: "models/routenet_tf2_physics_model/mlp/delay/lambda_physics_0.1"
+    delay_model_dir: "fixed_model/mlp_soft_0.1"
     use_kan: false
-    
     
   mlp_soft_1.0:
     model_type: "mlp"
     physics_type: "soft"
     lambda_physics: 1.0
-    delay_model_dir: "models/routenet_tf2_physics_model/mlp/delay/lambda_physics_1"
+    delay_model_dir: "fixed_model/mlp_soft_1.0"
     use_kan: false
-    
     
   # MLP模型 - 硬约束
   mlp_hard_0.1:
     model_type: "mlp"
     physics_type: "hard"
     lambda_physics: 0.1
-    delay_model_dir: "models/routenet_tf2_hard_physics_model/mlp/delay/lambda_physics_0.1"
+    delay_model_dir: "fixed_model/mlp_hard_0.1"
     use_kan: false
-    
     
   mlp_hard_1.0:
     model_type: "mlp"
     physics_type: "hard"
     lambda_physics: 1.0
-    delay_model_dir: "models/routenet_tf2_hard_physics_model/mlp/delay/lambda_physics_1"
+    delay_model_dir: "fixed_model/mlp_hard_1.0"
     use_kan: false
+
+  # KAN模型 - 软约束
+  kan_soft_0.1:
+    model_type: "kan"
+    physics_type: "soft"
+    lambda_physics: 0.1
+    delay_model_dir: "fixed_model/kan_soft_0.1"
+    use_kan: true
+    
+  kan_soft_1.0:
+    model_type: "kan"
+    physics_type: "soft"
+    lambda_physics: 1.0
+    delay_model_dir: "fixed_model/kan_soft_1.0"
+    use_kan: true
+    
+  # KAN模型 - 硬约束
+  kan_hard_0.1:
+    model_type: "kan"
+    physics_type: "hard"
+    lambda_physics: 0.1
+    delay_model_dir: "fixed_model/kan_hard_0.1"
+    use_kan: true
+    
+  kan_hard_1.0:
+    model_type: "kan"
+    physics_type: "hard"
+    lambda_physics: 1.0
+    delay_model_dir: "fixed_model/kan_hard_1.0"
+    use_kan: true
     
 
 # 实验定义
