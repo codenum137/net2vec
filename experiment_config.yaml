@@ -17,7 +17,7 @@ global_settings:
   num_points: 20
   
   # 输出根目录
-  base_output_dir: "experiment_results"
+  base_output_dir: "experiment_results/test"
 
 # 模型配置
 models:
