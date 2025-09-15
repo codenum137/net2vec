@@ -326,6 +326,145 @@ class OriginalRouteNetGradientChecker:
         
         return shared_links_matrix, shared_links_count, path_links
 
+    def _compute_s_self_formula(self, diagonal_gradients, path_to_vary, n_samples):
+        """
+        计算 S_self = (1/N) * Σ I(g_kk^(i) >= 0)
+        自影响梯度为正的比例
+        """
+        self_gradients = diagonal_gradients[:, path_to_vary]
+        positive_count = np.sum(self_gradients >= 0)
+        return positive_count / n_samples
+
+    def _compute_s_mono_formula(self, delay_predictions, path_to_vary, n_samples):
+        """
+        计算 S_mono = (1/N) * Σ I(d_k^(i+1) >= d_k^(i))
+        延迟单调性：后续流量下的延迟 >= 前一个流量下的延迟
+        """
+        delays = delay_predictions[:, path_to_vary]
+        if len(delays) < 2:
+            return 1.0
+        
+        # 计算相邻延迟差
+        delay_diffs = np.diff(delays)
+        # 单调递增（允许小的数值误差）
+        monotonic_count = np.sum(delay_diffs >= -1e-8)
+        return monotonic_count / (n_samples - 1)
+
+    def _compute_s_cross_formula(self, cross_gradients, shared_links_matrix, 
+                                path_to_vary, n_paths, n_samples):
+        """
+        计算 S_cross = (1/M) * Σ_m (1/N) * Σ_i I(g_km^(i) >= 0)
+        共享链路路径的交叉影响梯度为正的比例
+        M: 与path_to_vary共享链路的路径数量
+        """
+        shared_path_scores = []
+        
+        for key, cross_grad in cross_gradients.items():
+            # 解析梯度键：J_ij 表示 ∂D_i/∂T_j
+            parts = key.split('_')
+            if len(parts) == 2:
+                i = int(parts[1][0])  # 受影响的路径
+                j = int(parts[1][1])  # 影响路径（应该是path_to_vary）
+                
+                # 检查是否共享链路
+                if j == path_to_vary and shared_links_matrix[i][j]:
+                    positive_count = np.sum(cross_grad >= 0)
+                    path_score = positive_count / n_samples
+                    shared_path_scores.append(path_score)
+        
+        if len(shared_path_scores) == 0:
+            return 1.0  # 无共享路径时给满分
+        
+        return np.mean(shared_path_scores)
+
+    def _compute_s_indep_formula(self, cross_gradients, shared_links_matrix, 
+                                path_to_vary, n_paths, n_samples):
+        """
+        计算 S_indep = (1/L) * Σ_l (1/N) * Σ_i I(|g_kl^(i)| <= ε)
+        独立路径的交叉影响梯度接近零的比例
+        L: 与path_to_vary不共享链路的路径数量
+        ε: 很小的阈值，例如0.001
+        """
+        epsilon = 0.001
+        independent_path_scores = []
+        
+        for key, cross_grad in cross_gradients.items():
+            # 解析梯度键：J_ij 表示 ∂D_i/∂T_j
+            parts = key.split('_')
+            if len(parts) == 2:
+                i = int(parts[1][0])  # 受影响的路径
+                j = int(parts[1][1])  # 影响路径（应该是path_to_vary）
+                
+                # 检查是否为独立路径（不共享链路）
+                if j == path_to_vary and not shared_links_matrix[i][j]:
+                    small_gradient_count = np.sum(np.abs(cross_grad) <= epsilon)
+                    path_score = small_gradient_count / n_samples
+                    independent_path_scores.append(path_score)
+        
+        if len(independent_path_scores) == 0:
+            return 1.0  # 无独立路径时给满分
+        
+        return np.mean(independent_path_scores)
+
+    def _compute_s_congest_formula(self, diagonal_gradients, path_to_vary, n_samples):
+        """
+        计算 S_congest = I(g_mean_high >= α * g_mean_low)
+        拥塞敏感性：高流量区域的平均梯度 >= α倍低流量区域的平均梯度
+        α: 拥塞敏感因子，例如1.2
+        """
+        alpha = 1.2
+        self_gradients = diagonal_gradients[:, path_to_vary]
+        
+        if n_samples < 4:
+            return 1.0
+        
+        # 计算低流量区域（前25%）和高流量区域（后25%）的平均梯度
+        low_traffic_end = max(1, n_samples // 4)
+        high_traffic_start = max(low_traffic_end, n_samples - n_samples // 4)
+        
+        g_mean_low = np.mean(self_gradients[:low_traffic_end])
+        g_mean_high = np.mean(self_gradients[high_traffic_start:])
+        
+        # 避免除零错误
+        if g_mean_low <= 1e-10:
+            return 1.0 if g_mean_high > 1e-10 else 0.0
+        
+        return 1.0 if g_mean_high >= alpha * g_mean_low else 0.0
+
+    def _print_pc_score_results(self, validation_results, path_to_vary):
+        """打印PC-Score结果"""
+        print("\n" + "="*70)
+        print("PC-Score (物理一致性评分) 结果 - 原版RouteNet")
+        print("="*70)
+        
+        pc_score = validation_results['pc_score']
+        components = validation_results['components']
+        weights = validation_results['weights']
+        
+        print(f"\n🎯 PC-Score 总分: {pc_score:.4f}")
+        print(f"   验证状态: {'✅ 通过' if validation_results['validation_passed'] else '❌ 未通过'}")
+        print(f"   路径 {path_to_vary} 的物理一致性评估")
+        
+        print(f"\n📊 各组件得分:")
+        print(f"   S_self   (自影响为正):     {components['s_self']:.4f} × {weights['self']:.2f} = {components['s_self'] * weights['self']:.4f}")
+        print(f"   S_mono   (延迟单调性):     {components['s_mono']:.4f} × {weights['mono']:.2f} = {components['s_mono'] * weights['mono']:.4f}")
+        print(f"   S_cross  (共享路径影响):   {components['s_cross']:.4f} × {weights['cross']:.2f} = {components['s_cross'] * weights['cross']:.4f}")
+        print(f"   S_indep  (独立路径零影响): {components['s_indep']:.4f} × {weights['indep']:.2f} = {components['s_indep'] * weights['indep']:.4f}")
+        print(f"   S_congest(拥塞敏感性):     {components['s_congest']:.4f} × {weights['congest']:.2f} = {components['s_congest'] * weights['congest']:.4f}")
+        
+        print(f"\n📈 解释:")
+        # PC-Score区间解释
+        if pc_score >= 0.95:
+            print(f"   🌟 优秀 - 模型完全掌握了网络物理规律")
+        elif pc_score >= 0.85:
+            print(f"   ⭐ 良好 - 模型很好地掌握了网络物理规律")
+        elif pc_score >= 0.7:
+            print(f"   ✓ 可接受 - 模型基本掌握了网络物理规律")
+        elif pc_score >= 0.5:
+            print(f"   ⚠ 一般 - 模型部分掌握了网络物理规律")
+        else:
+            print(f"   ❌ 较差 - 模型未能很好地学习网络物理规律")
+
     def validate_physical_intuition(self, experiment_results, network_config, 
                                    path_to_vary, output_dir):
         """
@@ -348,14 +487,50 @@ class OriginalRouteNetGradientChecker:
         cross_gradients = experiment_results['cross_gradients']
         
         n_paths = network_config['n_paths']
+        n_samples = len(traffic_values)
         
-        # 验证结果记录
+        # 检查数据完整性
+        if len(diagonal_gradients) == 0:
+            print("错误：没有成功计算任何梯度值")
+            return {'pc_score': 0.0, 'validation_passed': False, 'components': {}, 'weights': {}}
+
+        # PC-Score权重配置（重点强调物理规律重要性层次）
+        weights = {
+            'self': 0.35,    # 自影响为正 - 最重要的基础物理规律
+            'mono': 0.25,    # 延迟单调性 - 核心物理特性 
+            'cross': 0.15,   # 共享路径影响 - 拓扑感知
+            'indep': 0.15,   # 独立路径零影响 - 拓扑感知
+            'congest': 0.10  # 拥塞敏感性 - 高级特性
+        }
+
+        # 1. 计算PC-Score各组件
+        s_self = self._compute_s_self_formula(diagonal_gradients, path_to_vary, n_samples)
+        s_mono = self._compute_s_mono_formula(delay_predictions, path_to_vary, n_samples) 
+        s_cross = self._compute_s_cross_formula(cross_gradients, shared_links_matrix, 
+                                              path_to_vary, n_paths, n_samples)
+        s_indep = self._compute_s_indep_formula(cross_gradients, shared_links_matrix, 
+                                              path_to_vary, n_paths, n_samples)
+        s_congest = self._compute_s_congest_formula(diagonal_gradients, path_to_vary, n_samples)
+        
+        # 2. 计算加权PC-Score
+        pc_score = (weights['self'] * s_self + 
+                   weights['mono'] * s_mono + 
+                   weights['cross'] * s_cross + 
+                   weights['indep'] * s_indep + 
+                   weights['congest'] * s_congest)
+        
+        # 3. 构建验证结果
         validation_results = {
-            'self_gradient_positive': True,
-            'cross_gradient_positive': True,
-            'delay_monotonic': True,
-            'gradient_increases_with_congestion': True,
-            'physical_intuition_score': 0.0,
+            'pc_score': pc_score,
+            'validation_passed': pc_score >= 0.7,
+            'components': {
+                's_self': s_self,
+                's_mono': s_mono, 
+                's_cross': s_cross,
+                's_indep': s_indep,
+                's_congest': s_congest
+            },
+            'weights': weights,
             'topology_info': {
                 'shared_links_matrix': shared_links_matrix,
                 'shared_links_count': shared_links_count,
@@ -363,119 +538,8 @@ class OriginalRouteNetGradientChecker:
             }
         }
         
-        print("\n" + "="*60)
-        print("原版RouteNet梯度物理意义验证结果 (拓扑感知)")
-        print("="*60)
-        
-        # 打印拓扑信息
-        print("\n0. 网络拓扑分析:")
-        for i in range(n_paths):
-            print(f"   路径 {i} 使用链路: {sorted(list(path_links[i]))}")
-        
-        print("\n   路径间链路共享关系:")
-        for i in range(n_paths):
-            for j in range(n_paths):
-                if i != j and shared_links_matrix[i][j]:
-                    shared_links = path_links[i].intersection(path_links[j])
-                    print(f"   路径 {i} ↔ 路径 {j}: 共享链路 {sorted(list(shared_links))} ({shared_links_count[i][j]} 条)")
-        
-        if len(diagonal_gradients) == 0:
-            print("错误：没有成功计算任何梯度值")
-            validation_results['physical_intuition_score'] = 0.0
-            return validation_results
-        
-        # 1. 验证自影响梯度 J_ii > 0
-        self_gradients = diagonal_gradients[:, path_to_vary]
-        positive_self_ratio = np.sum(self_gradients > 0) / len(self_gradients)
-        print(f"\n1. 自影响梯度 J_{path_to_vary}{path_to_vary} > 0:")
-        print(f"   正值比例: {positive_self_ratio:.2%}")
-        print(f"   平均值: {np.mean(self_gradients):.6f}")
-        print(f"   范围: [{np.min(self_gradients):.6f}, {np.max(self_gradients):.6f}]")
-        
-        if positive_self_ratio < 0.8:
-            validation_results['self_gradient_positive'] = False
-        
-        # 2. 拓扑感知的交叉影响梯度验证
-        print(f"\n2. 交叉影响梯度分析 (拓扑感知):")
-        
-        cross_gradient_validations = []
-        
-        for key, cross_grad in cross_gradients.items():
-            # 解析梯度键：J_ij 表示 ∂D_i/∂T_j
-            parts = key.split('_')
-            if len(parts) == 2:
-                i = int(parts[1][0])  # 受影响的路径 i
-                j = int(parts[1][1])  # 影响的路径 j (应该是path_to_vary)
-                
-                # 检查路径i和路径j是否共享链路
-                if shared_links_matrix[i][j]:
-                    # 共享链路，期望正梯度
-                    positive_cross_ratio = np.sum(cross_grad > 0) / len(cross_grad)
-                    shared_links = path_links[i].intersection(path_links[j])
-                    
-                    print(f"   {key} > 0 (共享链路 {sorted(list(shared_links))}): {positive_cross_ratio:.2%}")
-                    print(f"     平均值: {np.mean(cross_grad):.6f}")
-                    
-                    cross_gradient_validations.append(positive_cross_ratio >= 0.6)
-                    
-                else:
-                    # 不共享链路，交叉影响应该较小，不强制要求正值
-                    positive_cross_ratio = np.sum(cross_grad > 0) / len(cross_grad)
-                    avg_magnitude = np.mean(np.abs(cross_grad))
-                    
-                    print(f"   {key} (无共享链路): {positive_cross_ratio:.2%}")
-                    print(f"     平均值: {np.mean(cross_grad):.6f}, 平均幅度: {avg_magnitude:.6f}")
-                    
-                    # 对于不共享链路的路径，不纳入验证标准，但记录信息
-                    print(f"     → 无共享链路，交叉影响预期较小")
-        
-        # 只有共享链路的交叉梯度需要满足正值要求
-        if cross_gradient_validations:
-            validation_results['cross_gradient_positive'] = all(cross_gradient_validations)
-        else:
-            # 如果没有共享链路的路径对，这项验证自动通过
-            validation_results['cross_gradient_positive'] = True
-            print(f"   注意: 路径 {path_to_vary} 与其他路径无共享链路，交叉梯度验证自动通过")
-        
-        # 3. 验证延迟单调性
-        print(f"\n3. 延迟单调性验证:")
-        for i in range(n_paths):
-            delays = delay_predictions[:, i]
-            # 计算单调递增的比例
-            diff = np.diff(delays)
-            monotonic_ratio = np.sum(diff >= -1e-6) / len(diff)  # 允许小的数值误差
-            print(f"   路径 {i} 延迟单调递增比例: {monotonic_ratio:.2%}")
-            
-            if monotonic_ratio < 0.8:
-                validation_results['delay_monotonic'] = False
-        
-        # 4. 验证梯度随拥塞增大
-        print(f"\n4. 梯度拥塞敏感性验证:")
-        # 比较低流量和高流量时的梯度
-        low_traffic_idx = len(traffic_values) // 4  # 前25%
-        high_traffic_idx = -len(traffic_values) // 4  # 后25%
-        
-        low_gradient = np.mean(self_gradients[:low_traffic_idx])
-        high_gradient = np.mean(self_gradients[high_traffic_idx:])
-        gradient_increase_ratio = high_gradient / (low_gradient + 1e-9)
-        
-        print(f"   低流量时平均梯度: {low_gradient:.6f}")
-        print(f"   高流量时平均梯度: {high_gradient:.6f}")
-        print(f"   梯度增长比例: {gradient_increase_ratio:.2f}x")
-        
-        if gradient_increase_ratio < 1.5:
-            validation_results['gradient_increases_with_congestion'] = False
-        
-        # 计算总体得分
-        score_components = [
-            validation_results['self_gradient_positive'],
-            validation_results['cross_gradient_positive'], 
-            validation_results['delay_monotonic'],
-            validation_results['gradient_increases_with_congestion']
-        ]
-        validation_results['physical_intuition_score'] = sum(score_components) / len(score_components)
-        
-        print(f"\n4. 总体物理直觉得分: {validation_results['physical_intuition_score']:.2%}")
+        # 打印PC-Score结果
+        self._print_pc_score_results(validation_results, path_to_vary)
         
         # 可视化结果
         self._visualize_results(experiment_results, path_to_vary, output_dir, validation_results)
@@ -535,48 +599,69 @@ class OriginalRouteNetGradientChecker:
         ax3.grid(True, alpha=0.3)
         ax3.axhline(y=0, color='k', linestyle='--', alpha=0.5)
         
-        # 4. 验证结果总览
+        # 4. PC-Score结果文本总结
         ax4 = axes[1, 1]
-        metrics = ['Self>0', 'Cross>0', 'Monotonic', 'Congest-Sens']
-        scores = [
-            validation_results['self_gradient_positive'],
-            validation_results['cross_gradient_positive'],
-            validation_results['delay_monotonic'],
-            validation_results['gradient_increases_with_congestion']
-        ]
-        colors_bar = ['green' if s else 'red' for s in scores]
+        ax4.axis('off')  # 隐藏坐标轴
         
-        bars = ax4.bar(metrics, [1 if s else 0 for s in scores], color=colors_bar)
-        ax4.set_ylabel('Validation Pass')
-        ax4.set_title(f'Physical Intuition Validation (Original RouteNet)\nScore: {validation_results["physical_intuition_score"]:.1%}')
-        ax4.set_ylim(0, 1.2)
+        # 创建PC-Score验证结果文本总结
+        pc_score = validation_results['pc_score']
+        components = validation_results['components']
+        weights = validation_results['weights']
         
-        for bar, score in zip(bars, scores):
-            height = bar.get_height()
-            ax4.text(bar.get_x() + bar.get_width()/2., height + 0.05,
-                    '✓' if score else '✗', ha='center', va='bottom', fontsize=16)
+        summary_text = f"PC-Score Physical Consistency Summary\n"
+        summary_text += f"Overall PC-Score: {pc_score:.4f}\n"
+        summary_text += f"Status: {'✓ PASS' if validation_results['validation_passed'] else '✗ FAIL'}\n\n"
         
-        plt.suptitle('Original RouteNet - Gradient Physical Intuition Validation', 
+        # PC-Score组件得分
+        summary_text += f"Component Scores:\n"
+        summary_text += f"S_self:    {components['s_self']:.3f} × {weights['self']:.2f} = {components['s_self'] * weights['self']:.4f}\n"
+        summary_text += f"S_mono:    {components['s_mono']:.3f} × {weights['mono']:.2f} = {components['s_mono'] * weights['mono']:.4f}\n"
+        summary_text += f"S_cross:   {components['s_cross']:.3f} × {weights['cross']:.2f} = {components['s_cross'] * weights['cross']:.4f}\n"
+        summary_text += f"S_indep:   {components['s_indep']:.3f} × {weights['indep']:.2f} = {components['s_indep'] * weights['indep']:.4f}\n"
+        summary_text += f"S_congest: {components['s_congest']:.3f} × {weights['congest']:.2f} = {components['s_congest'] * weights['congest']:.4f}\n"
+        
+        # 添加详细统计信息
+        if diagonal_gradients.shape[1] > path_to_vary:
+            self_gradients = diagonal_gradients[:, path_to_vary]
+            self_pos_ratio = np.sum(self_gradients > 0) / len(self_gradients)
+            summary_text += f"\nDetailed Statistics:\n"
+            summary_text += f"Self-gradient positive ratio: {self_pos_ratio:.1%}\n"
+            summary_text += f"Self-gradient mean: {np.mean(self_gradients):.6f}\n"
+        
+            for key, cross_grad in cross_gradients.items():
+                if len(cross_grad) > 0:
+                    cross_pos_ratio = np.sum(cross_grad > 0) / len(cross_grad)
+                    summary_text += f"{key} positive ratio: {cross_pos_ratio:.1%}\n"
+        
+        ax4.text(0.05, 0.95, summary_text, transform=ax4.transAxes, fontsize=10,
+                verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+        
+        plt.suptitle(f'Original RouteNet - PC-Score Physical Consistency Validation (Path {path_to_vary})', 
                      fontsize=16, y=0.95)
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, f'original_routenet_sanity_check_path_{path_to_vary}.png'), 
                    dpi=300, bbox_inches='tight')
         plt.close()
         
-        # 保存详细结果
-        with open(os.path.join(output_dir, f'original_routenet_results_path_{path_to_vary}.txt'), 'w') as f:
-            f.write("Original RouteNet - Gradient Physical Intuition Validation Results\n")
+        # 保存简化的PC-Score结果
+        with open(os.path.join(output_dir, f'original_routenet_pc_score_results_path_{path_to_vary}.txt'), 'w', encoding='utf-8') as f:
+            f.write(f"Original RouteNet - PC-Score Physical Consistency Results\n")
             f.write("="*60 + "\n")
-            f.write(f"Varying Path: {path_to_vary}\n")
-            f.write(f"Traffic Range: {traffic_values[0]:.2f} - {traffic_values[-1]:.2f}\n")
-            f.write(f"Number of Points: {len(traffic_values)}\n\n")
+            f.write(f"Path: {path_to_vary}\n")
+            f.write(f"PC-Score: {validation_results['pc_score']:.4f}\n")
+            f.write(f"Status: {'PASS' if validation_results['validation_passed'] else 'FAIL'}\n\n")
             
-            f.write("Validation Results:\n")
-            f.write(f"  Self-influence Gradient > 0: {'Pass' if validation_results['self_gradient_positive'] else 'Fail'}\n")
-            f.write(f"  Cross-influence Gradient > 0: {'Pass' if validation_results['cross_gradient_positive'] else 'Fail'}\n")
-            f.write(f"  Delay Monotonic Increase: {'Pass' if validation_results['delay_monotonic'] else 'Fail'}\n")
-            f.write(f"  Congestion Sensitivity: {'Pass' if validation_results['gradient_increases_with_congestion'] else 'Fail'}\n")
-            f.write(f"\nOverall Physical Intuition Score: {validation_results['physical_intuition_score']:.1%}\n")
+            # PC-Score组件详情
+            components = validation_results['components']
+            weights = validation_results['weights']
+            f.write("PC-Score Components:\n")
+            f.write("-" * 30 + "\n")
+            f.write(f"S_self:    {components['s_self']:.4f} × {weights['self']:.2f} = {components['s_self'] * weights['self']:.4f}\n")
+            f.write(f"S_mono:    {components['s_mono']:.4f} × {weights['mono']:.2f} = {components['s_mono'] * weights['mono']:.4f}\n")
+            f.write(f"S_cross:   {components['s_cross']:.4f} × {weights['cross']:.2f} = {components['s_cross'] * weights['cross']:.4f}\n")
+            f.write(f"S_indep:   {components['s_indep']:.4f} × {weights['indep']:.2f} = {components['s_indep'] * weights['indep']:.4f}\n")
+            f.write(f"S_congest: {components['s_congest']:.4f} × {weights['congest']:.2f} = {components['s_congest'] * weights['congest']:.4f}\n")
     
     def close(self):
         """关闭TensorFlow session"""
@@ -638,7 +723,7 @@ def main():
         
         # 计算总体结果
         overall_score = np.mean([
-            results['physical_intuition_score'] 
+            results['pc_score'] 
             for results in overall_results.values()
         ])
         
@@ -646,14 +731,12 @@ def main():
         print("总体验证结果")
         print(f"{'='*60}")
         print(f"模型类型: Original RouteNet (TF1.x)")
-        print(f"总体物理直觉得分: {overall_score:.1%}")
+        print(f"总体PC-Score得分: {overall_score:.4f}")
         
-        if overall_score >= 0.8:
-            print("✅ 原版RouteNet梯度计算通过物理意义验证！")
-        elif overall_score >= 0.6:
-            print("⚠️  原版RouteNet梯度计算部分通过验证，需要进一步检查")
+        if overall_score >= 0.7:
+            print("✅ 原版RouteNet梯度计算通过PC-Score物理一致性验证！")
         else:
-            print("❌ 原版RouteNet梯度计算未通过物理意义验证，需要检查实现")
+            print("❌ 原版RouteNet梯度计算未通过PC-Score验证，需要检查实现")
         
         print(f"\n详细结果已保存到: {args.output_dir}")
         

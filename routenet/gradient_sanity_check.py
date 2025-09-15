@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 from jacobian_analysis import JacobianAnalyzer, create_simple_network_sample
+from optimized_jacobian_analysis import OptimizedJacobianAnalyzer
 from routenet_tf2 import RouteNet, create_model_and_loss_fn
 import argparse
 from tqdm import tqdm
@@ -17,11 +18,15 @@ from tqdm import tqdm
 class GradientSanityChecker:
     """梯度物理意义验证器"""
     
-    def __init__(self, model_path, config, target='delay', use_kan=False):
+    def __init__(self, model_path, config, target='delay', use_kan=False, use_optimized=True):
         """初始化验证器"""
-        self.analyzer = JacobianAnalyzer(model_path, config, target, use_kan)
+        if use_optimized:
+            self.analyzer = OptimizedJacobianAnalyzer(model_path, config, target, use_kan)
+        else:
+            self.analyzer = JacobianAnalyzer(model_path, config, target, use_kan)
         self.use_kan = use_kan
         self.target = target
+        self.use_optimized = use_optimized
     
     def _apply_routenet_scaling(self, features):
         """
@@ -100,7 +105,7 @@ class GradientSanityChecker:
         return network_config
     
     def traffic_sweep_experiment(self, network_config, path_to_vary=0, 
-                               traffic_range=(0.1, 1.0), num_points=20):
+                               traffic_range=(0.1, 1.0), num_points=20, batch_size=8):
         """
         流量扫描实验：固定其他路径流量，变化指定路径流量
         
@@ -109,6 +114,7 @@ class GradientSanityChecker:
             path_to_vary: 要变化流量的路径索引
             traffic_range: 流量变化范围 (min, max) - 基于数据集实际范围0.086-1.103
             num_points: 采样点数量
+            batch_size: 批处理大小（只对优化版本有效）
         
         Returns:
             experiment_results: 实验结果字典
@@ -117,6 +123,112 @@ class GradientSanityChecker:
         
         # 生成流量序列
         traffic_values = np.linspace(traffic_range[0], traffic_range[1], num_points)
+        
+        # 检查是否使用优化版本
+        if self.use_optimized and hasattr(self.analyzer, 'optimized_traffic_sweep'):
+            # 使用优化的批量处理
+            print(f"🚀 使用优化批量流量扫描 (批大小: {batch_size})...")
+            
+            # 构造基础样本特征
+            base_traffic = network_config['base_traffic'].copy()
+            raw_features = {
+                'traffic': base_traffic,
+                'capacities': network_config['capacities'],
+                'links': network_config['links'],
+                'paths': network_config['paths'],
+                'sequences': network_config['sequences'],
+                'n_links': network_config['n_links'],
+                'n_paths': network_config['n_paths'],
+                'packets': network_config['packets']
+            }
+            
+            # ⚠️ 重要：应用与routenet_tf2.py相同的数据标准化
+            base_sample = self._apply_routenet_scaling(raw_features)
+            
+            # 使用优化的逐点处理（避免批处理的标准化问题）
+            results = self._optimized_sequential_sweep(
+                network_config, traffic_values, path_to_vary
+            )
+            
+            # 添加流量值到结果中
+            results['traffic_values'] = traffic_values
+            
+        else:
+            # 使用原始的逐点处理
+            print("⚠️  使用传统逐点流量扫描...")
+            
+            results = {
+                'traffic_values': traffic_values,
+                'delay_predictions': [],
+                'jacobian_matrices': [],
+                'diagonal_gradients': [],  # J_ii: ∂D_i/∂T_i
+                'cross_gradients': {},     # J_ij: ∂D_i/∂T_j (i≠j)
+            }
+            
+            # 为每个共享链路的路径对记录交叉梯度
+            for i in range(network_config['n_paths']):
+                if i != path_to_vary:
+                    results['cross_gradients'][f'J_{i}{path_to_vary}'] = []
+            
+            base_traffic = network_config['base_traffic'].copy()
+            
+            for traffic_val in tqdm(traffic_values, desc="流量扫描"):
+                # 设置当前流量
+                current_traffic = base_traffic.copy()
+                current_traffic[path_to_vary] = traffic_val
+                
+                # 构造原始样本特征
+                raw_features = {
+                    'traffic': current_traffic,
+                    'capacities': network_config['capacities'],
+                    'links': network_config['links'],
+                    'paths': network_config['paths'],
+                    'sequences': network_config['sequences'],
+                    'n_links': network_config['n_links'],
+                    'n_paths': network_config['n_paths'],
+                    'packets': network_config['packets']
+                }
+                
+                # ⚠️ 重要：应用与routenet_tf2.py相同的数据标准化
+                sample_features = self._apply_routenet_scaling(raw_features)
+                
+                # 计算雅可比矩阵和延迟预测
+                jacobian, delay_pred = self.analyzer.compute_jacobian(sample_features)
+                
+                results['delay_predictions'].append(delay_pred)
+                results['jacobian_matrices'].append(jacobian)
+                results['diagonal_gradients'].append(np.diag(jacobian))
+                
+                # 记录交叉梯度
+                for i in range(network_config['n_paths']):
+                    if i != path_to_vary:
+                        results['cross_gradients'][f'J_{i}{path_to_vary}'].append(
+                            jacobian[i, path_to_vary]
+                        )
+            
+            # 转换为numpy数组
+            results['delay_predictions'] = np.array(results['delay_predictions'])
+            results['jacobian_matrices'] = np.array(results['jacobian_matrices'])
+            results['diagonal_gradients'] = np.array(results['diagonal_gradients'])
+            
+            for key in results['cross_gradients']:
+                results['cross_gradients'][key] = np.array(results['cross_gradients'][key])
+        
+        return results
+    
+    def _optimized_sequential_sweep(self, network_config, traffic_values, path_to_vary):
+        """
+        优化的逐点流量扫描（确保与传统版本完全一致）
+        
+        Args:
+            network_config: 网络配置
+            traffic_values: 流量值数组
+            path_to_vary: 要变化的路径索引
+            
+        Returns:
+            results: 实验结果字典
+        """
+        print("🚀 使用优化逐点流量扫描（确保一致性）...")
         
         results = {
             'traffic_values': traffic_values,
@@ -133,7 +245,7 @@ class GradientSanityChecker:
         
         base_traffic = network_config['base_traffic'].copy()
         
-        for traffic_val in tqdm(traffic_values, desc="流量扫描"):
+        for traffic_val in tqdm(traffic_values, desc="优化流量扫描"):
             # 设置当前流量
             current_traffic = base_traffic.copy()
             current_traffic[path_to_vary] = traffic_val
@@ -153,7 +265,7 @@ class GradientSanityChecker:
             # ⚠️ 重要：应用与routenet_tf2.py相同的数据标准化
             sample_features = self._apply_routenet_scaling(raw_features)
             
-            # 计算雅可比矩阵和延迟预测
+            # 计算雅可比矩阵和延迟预测（使用优化版本的analyzer）
             jacobian, delay_pred = self.analyzer.compute_jacobian(sample_features)
             
             results['delay_predictions'].append(delay_pred)
@@ -623,6 +735,10 @@ def main():
                        help='最大流量值 (基于数据集范围0.086-1.103)')
     parser.add_argument('--num_points', type=int, default=10,
                        help='流量采样点数量')
+    parser.add_argument('--batch_size', type=int, default=8,
+                       help='批处理大小（优化版本）')
+    parser.add_argument('--no_optimize', action='store_true', 
+                       help='禁用批量优化，使用传统逐点处理')
     
     args = parser.parse_args()
     
@@ -649,7 +765,8 @@ def main():
             model_path=weight_file,
             config=config,
             target=args.target,
-            use_kan=args.use_kan
+            use_kan=args.use_kan,
+            use_optimized=not args.no_optimize
         )
         
         print("创建可控网络拓扑...")
@@ -674,7 +791,8 @@ def main():
                 network_config,
                 path_to_vary=path_id,
                 traffic_range=(args.traffic_min, args.traffic_max),
-                num_points=args.num_points
+                num_points=args.num_points,
+                batch_size=args.batch_size
             )
             
             # 验证物理意义

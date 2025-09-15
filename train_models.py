@@ -19,7 +19,7 @@ class ModelTrainer:
         self.train_script = self.base_dir / "routenet" / "routenet_tf2.py"
         self.train_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "train"
         self.eval_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "evaluate"
-        self.models_base_dir = self.base_dir / "fixed_model"
+        self.models_base_dir = self.base_dir / "fixed_model/0915"
         self.force_retrain = force_retrain  # 是否强制重新训练已存在的模型
         
         # 训练配置
