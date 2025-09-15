@@ -42,7 +42,7 @@ class ModelTrainer:
         ]
         
         # lambda_physics参数
-        lambda_values = [0.1, 1.0]
+        lambda_values = [0.1,0.5, 1.0]
         
         for model_config in model_configs:
             if model_config["use_physics_loss"]:
@@ -124,8 +124,12 @@ class ModelTrainer:
         print(f"⚙️  配置: {config['model_type'].upper()}, {config['physics_type']}, λ={config['lambda_physics']}")
         print(f"{'='*60}")
         
-        # 检查模型是否已存在
-        model_file = config["model_dir"] / "best_delay_model.weights.h5"
+        # 检查模型是否已存在（根据模型类型选择正确的文件名）
+        if config["use_kan"]:
+            model_file = config["model_dir"] / "best_delay_kan_model.weights.h5"
+        else:
+            model_file = config["model_dir"] / "best_delay_model.weights.h5"
+            
         if model_file.exists() and not self.force_retrain:
             print(f"⏭️  模型已存在，跳过训练: {model_file}")
             print(f"💡 如需重新训练，请使用 --force 参数")

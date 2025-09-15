@@ -20,6 +20,82 @@ from routenet_tf2 import (
     scale_fn, heteroscedastic_loss, binomial_loss, create_model_and_loss_fn
 )
 
+def calculate_r2(y_pred, y_true):
+    """
+    计算R²决定系数
+    R² = 1 - SS_res / SS_tot
+    其中 SS_res = Σ(y_true - y_pred)²  (残差平方和)
+         SS_tot = Σ(y_true - y_mean)²  (总平方和)
+    
+    Args:
+        y_pred: 预测值数组
+        y_true: 真实值数组
+    
+    Returns:
+        r2: R²值，范围通常在(-∞, 1]，1表示完美拟合
+    """
+    # 去除无效值
+    mask = np.isfinite(y_pred) & np.isfinite(y_true)
+    if np.sum(mask) < 2:
+        return float('-inf')
+    
+    y_pred_clean = y_pred[mask]
+    y_true_clean = y_true[mask]
+    
+    # 计算总平方和
+    ss_tot = np.sum((y_true_clean - np.mean(y_true_clean)) ** 2)
+    
+    # 计算残差平方和
+    ss_res = np.sum((y_true_clean - y_pred_clean) ** 2)
+    
+    # 计算R²
+    if ss_tot == 0:
+        return 1.0 if ss_res == 0 else float('-inf')
+    
+    r2 = 1 - (ss_res / ss_tot)
+    return r2
+
+def calculate_nll(y_pred_mean, y_pred_scale, y_true):
+    """
+    计算异方差模型的负对数似然 (Negative Log-Likelihood)
+    
+    对于正态分布 N(μ, σ²)，负对数似然为：
+    NLL = -log p(y|μ,σ) = 0.5 * log(2π) + log(σ) + 0.5 * ((y-μ)/σ)²
+    
+    Args:
+        y_pred_mean: 预测均值 (μ)
+        y_pred_scale: 预测标准差 (σ)
+        y_true: 真实值 (y)
+    
+    Returns:
+        nll: 平均负对数似然值
+    """
+    # 去除无效值
+    mask = (np.isfinite(y_pred_mean) & 
+            np.isfinite(y_pred_scale) & 
+            np.isfinite(y_true) & 
+            (y_pred_scale > 0))  # 确保标准差为正
+    
+    if np.sum(mask) == 0:
+        return float('inf')
+    
+    mean_clean = y_pred_mean[mask]
+    scale_clean = y_pred_scale[mask]
+    true_clean = y_true[mask]
+    
+    # 计算标准化残差
+    normalized_residuals = (true_clean - mean_clean) / scale_clean
+    
+    # 计算负对数似然
+    # NLL = 0.5 * log(2π) + log(σ) + 0.5 * ((y-μ)/σ)²
+    log_2pi = np.log(2 * np.pi)
+    nll_per_sample = (0.5 * log_2pi + 
+                      np.log(scale_clean) + 
+                      0.5 * normalized_residuals ** 2)
+    
+    # 返回平均NLL
+    return np.mean(nll_per_sample)
+
 def load_model(model_dir, target, config, use_kan=False):
     """
     加载指定目标的模型
@@ -57,7 +133,7 @@ def load_model(model_dir, target, config, use_kan=False):
 
 def evaluate_model_metrics(model, dataset, dataset_name, num_samples=None):
     """
-    评估模型并计算MAE、RMSE、MAPE指标
+    评估模型并计算MAE、RMSE、MAPE、R²、NLL指标
     
     Args:
         model: 延迟预测模型
@@ -70,6 +146,7 @@ def evaluate_model_metrics(model, dataset, dataset_name, num_samples=None):
     """
     predictions_delay = []
     predictions_jitter = []
+    predictions_scale = []  # 用于计算NLL
     ground_truth_delay = []
     ground_truth_jitter = []
     
@@ -96,6 +173,7 @@ def evaluate_model_metrics(model, dataset, dataset_name, num_samples=None):
         # 存储结果
         predictions_delay.extend(pred_delay)
         predictions_jitter.extend(pred_jitter)
+        predictions_scale.extend(pred_scale)  # 保存scale用于NLL计算
         ground_truth_delay.extend(true_delay)
         ground_truth_jitter.extend(true_jitter)
         
@@ -106,6 +184,7 @@ def evaluate_model_metrics(model, dataset, dataset_name, num_samples=None):
     # 转换为numpy数组
     pred_delay = np.array(predictions_delay)
     pred_jitter = np.array(predictions_jitter)
+    pred_scale = np.array(predictions_scale)
     true_delay = np.array(ground_truth_delay)
     true_jitter = np.array(ground_truth_jitter)
     
@@ -113,6 +192,10 @@ def evaluate_model_metrics(model, dataset, dataset_name, num_samples=None):
     
     # 计算各项指标
     results = {}
+    
+    # 先计算delay的NLL（异方差负对数似然）
+    delay_nll = calculate_nll(pred_delay, pred_scale, true_delay)
+    results['delay_nll'] = delay_nll
     
     for metric_name, pred, true in [('delay', pred_delay, true_delay), 
                                     ('jitter', pred_jitter, true_jitter)]:
@@ -130,6 +213,9 @@ def evaluate_model_metrics(model, dataset, dataset_name, num_samples=None):
         else:
             mape = float('inf')
         
+        # R² (决定系数)
+        r2 = calculate_r2(pred, true)
+        
         # 相对误差统计
         relative_errors = (pred[mask] - true[mask]) / true[mask] if np.sum(mask) > 0 else np.array([])
         mean_relative_error = np.mean(relative_errors) if len(relative_errors) > 0 else 0
@@ -138,6 +224,7 @@ def evaluate_model_metrics(model, dataset, dataset_name, num_samples=None):
             'mae': mae,
             'rmse': rmse,
             'mape': mape,
+            'r2': r2,
             'mean_relative_error': mean_relative_error,
             'samples': len(pred),
             'valid_samples_for_mape': np.sum(mask)
@@ -147,8 +234,13 @@ def evaluate_model_metrics(model, dataset, dataset_name, num_samples=None):
         print(f"    MAE:  {mae:.6f}")
         print(f"    RMSE: {rmse:.6f}")
         print(f"    MAPE: {mape:.4f}%")
+        print(f"    R²:   {r2:.6f}")
         print(f"    Mean Relative Error: {mean_relative_error:.4f}")
         print(f"    Valid samples for MAPE: {np.sum(mask)}/{len(pred)}")
+    
+    # 打印NLL指标
+    print(f"  PROBABILISTIC METRICS:")
+    print(f"    Delay NLL: {delay_nll:.6f}")
     
     return results
 
@@ -161,7 +253,7 @@ def compare_models_performance(nsfnet_results, gbn_results, output_dir):
     print("="*80)
     
     # 创建性能对比表格
-    metrics = ['mae', 'rmse', 'mape']
+    metrics = ['mae', 'rmse', 'mape', 'r2']
     targets = ['delay', 'jitter']
     
     # 准备数据用于表格显示
@@ -169,22 +261,47 @@ def compare_models_performance(nsfnet_results, gbn_results, output_dir):
     
     for target in targets:
         for metric in metrics:
+            # 格式化数值显示
+            if metric == 'mape':
+                nsfnet_val = f"{nsfnet_results[target][metric]:.4f}%"
+                gbn_val = f"{gbn_results[target][metric]:.4f}%"
+            elif metric == 'r2':
+                nsfnet_val = f"{nsfnet_results[target][metric]:.6f}"
+                gbn_val = f"{gbn_results[target][metric]:.6f}"
+            else:
+                nsfnet_val = f"{nsfnet_results[target][metric]:.6f}"
+                gbn_val = f"{gbn_results[target][metric]:.6f}"
+            
             row = {
                 'Target': target.upper(),
                 'Metric': metric.upper(),
-                'NSFNet (Training Topology)': f"{nsfnet_results[target][metric]:.6f}" if metric != 'mape' else f"{nsfnet_results[target][metric]:.4f}%",
-                'GBN (Test Topology)': f"{gbn_results[target][metric]:.6f}" if metric != 'mape' else f"{gbn_results[target][metric]:.4f}%"
+                'NSFNet (Training Topology)': nsfnet_val,
+                'GBN (Test Topology)': gbn_val
             }
             
             # 计算性能退化（从训练拓扑到测试拓扑）
             if metric == 'mape':
                 degradation = gbn_results[target][metric] - nsfnet_results[target][metric]
                 row['Degradation'] = f"{degradation:+.4f}%"
+            elif metric == 'r2':
+                # R²的退化是减少，所以用相反的符号
+                degradation = gbn_results[target][metric] - nsfnet_results[target][metric]
+                row['Degradation'] = f"{degradation:+.6f}"
             else:
                 degradation_ratio = (gbn_results[target][metric] - nsfnet_results[target][metric]) / nsfnet_results[target][metric] * 100
                 row['Degradation'] = f"{degradation_ratio:+.2f}%"
             
             comparison_data.append(row)
+    
+    # 添加NLL指标（仅对delay有效）
+    nll_row = {
+        'Target': 'DELAY',
+        'Metric': 'NLL',
+        'NSFNet (Training Topology)': f"{nsfnet_results['delay_nll']:.6f}",
+        'GBN (Test Topology)': f"{gbn_results['delay_nll']:.6f}",
+        'Degradation': f"{((gbn_results['delay_nll'] - nsfnet_results['delay_nll']) / nsfnet_results['delay_nll'] * 100):+.2f}%"
+    }
+    comparison_data.append(nll_row)
     
     # 创建DataFrame并打印
     df = pd.DataFrame(comparison_data)
@@ -215,14 +332,31 @@ def compare_models_performance(nsfnet_results, gbn_results, output_dir):
         mape_degradation = gbn_results[target]['mape'] - nsfnet_results[target]['mape']
         print(f"  MAPE Degradation: {mape_degradation:+.4f}% ({nsfnet_results[target]['mape']:.4f}% → {gbn_results[target]['mape']:.4f}%)")
         
-        # 评估泛化质量
-        if mae_degradation < 50 and rmse_degradation < 50:
+        # R²泛化性能
+        r2_degradation = gbn_results[target]['r2'] - nsfnet_results[target]['r2']
+        print(f"  R² Degradation: {r2_degradation:+.6f} ({nsfnet_results[target]['r2']:.6f} → {gbn_results[target]['r2']:.6f})")
+        
+        # 评估泛化质量 (更新评估标准)
+        if mae_degradation < 50 and rmse_degradation < 50 and r2_degradation > -0.1:
             quality = "GOOD"
-        elif mae_degradation < 100 and rmse_degradation < 100:
+        elif mae_degradation < 100 and rmse_degradation < 100 and r2_degradation > -0.3:
             quality = "MODERATE"
         else:
             quality = "POOR"
         print(f"  Generalization Quality: {quality}")
+    
+    # NLL泛化性能（仅对delay）
+    print(f"\nPROBABILISTIC PERFORMANCE:")
+    nll_degradation = (gbn_results['delay_nll'] - nsfnet_results['delay_nll']) / nsfnet_results['delay_nll'] * 100
+    print(f"  Delay NLL Degradation: {nll_degradation:+.2f}% ({nsfnet_results['delay_nll']:.6f} → {gbn_results['delay_nll']:.6f})")
+    
+    if nll_degradation < 50:
+        nll_quality = "GOOD - Model uncertainty well calibrated"
+    elif nll_degradation < 100:
+        nll_quality = "MODERATE - Some uncertainty miscalibration"
+    else:
+        nll_quality = "POOR - Significant uncertainty miscalibration"
+    print(f"  Uncertainty Calibration: {nll_quality}")
 
 def main():
     parser = argparse.ArgumentParser(description='Numerical Performance Analysis for RouteNet')

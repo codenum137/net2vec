@@ -44,6 +44,13 @@ models:
     delay_model_dir: "fixed_model/mlp_soft_0.1"
     use_kan: false
     
+  mlp_soft_0.5:
+    model_type: "mlp"
+    physics_type: "soft"
+    lambda_physics: 0.5
+    delay_model_dir: "fixed_model/mlp_soft_0.5"
+    use_kan: false
+    
   mlp_soft_1.0:
     model_type: "mlp"
     physics_type: "soft"
@@ -57,6 +64,13 @@ models:
     physics_type: "hard"
     lambda_physics: 0.1
     delay_model_dir: "fixed_model/mlp_hard_0.1"
+    use_kan: false
+    
+  mlp_hard_0.5:
+    model_type: "mlp"
+    physics_type: "hard"
+    lambda_physics: 0.5
+    delay_model_dir: "fixed_model/mlp_hard_0.5"
     use_kan: false
     
   mlp_hard_1.0:
@@ -74,6 +88,13 @@ models:
     delay_model_dir: "fixed_model/kan_soft_0.1"
     use_kan: true
     
+  kan_soft_0.5:
+    model_type: "kan"
+    physics_type: "soft"
+    lambda_physics: 0.5
+    delay_model_dir: "fixed_model/kan_soft_0.5"
+    use_kan: true
+    
   kan_soft_1.0:
     model_type: "kan"
     physics_type: "soft"
@@ -87,6 +108,13 @@ models:
     physics_type: "hard"
     lambda_physics: 0.1
     delay_model_dir: "fixed_model/kan_hard_0.1"
+    use_kan: true
+    
+  kan_hard_0.5:
+    model_type: "kan"
+    physics_type: "hard"
+    lambda_physics: 0.5
+    delay_model_dir: "fixed_model/kan_hard_0.5"
     use_kan: true
     
   kan_hard_1.0:
