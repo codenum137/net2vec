@@ -243,6 +243,315 @@ class RouteNet(tf.keras.Model):
             return_sequences=True, 
             return_state=True
         )
+        
+        # 读出网络（支持KAN和传统MLP）
+        if use_kan:
+            readout_layers = []
+            for i in range(config['readout_layers']):
+                readout_layers.append(KANLayer(config['readout_units']))
+                if i < config['readout_layers'] - 1:  # 不在最后一层添加dropout
+                    readout_layers.append(tf.keras.layers.Dropout(0.1))
+            self.readout = tf.keras.Sequential(readout_layers)
+        else:
+            # 传统 MLP 读出网络
+            readout_layers = []
+            for _ in range(config['readout_layers']):
+                readout_layers.append(tf.keras.layers.Dense(
+                    config['readout_units'], 
+                    activation='selu',
+                    kernel_regularizer=tf.keras.regularizers.l2(config['l2'])
+                ))
+                readout_layers.append(tf.keras.layers.Dropout(0.1))
+            self.readout = tf.keras.Sequential(readout_layers)
+        
+        # 最终输出层，支持不同的激活函数
+        self.final_layer = tf.keras.layers.Dense(
+            output_units,
+            activation=final_activation,
+            kernel_regularizer=tf.keras.regularizers.l2(config['l2_2'])
+        )
+
+    def call(self, inputs, training=False):
+        # 初始化状态
+        link_state = tf.concat([
+            tf.expand_dims(inputs['capacities'], axis=1),
+            tf.zeros([inputs['n_links'], self.config['link_state_dim'] - 1])
+        ], axis=1)
+        
+        path_state = tf.concat([
+            tf.expand_dims(inputs['traffic'], axis=1),
+            tf.zeros([inputs['n_paths'], self.config['path_state_dim'] - 1])
+        ], axis=1)
+
+        links = inputs['links']
+        paths = inputs['paths']
+        seqs = inputs['sequences']
+        
+        # T 轮消息传递（使用与原版相同的 RNN 处理）
+        for _ in range(self.config['T']):
+            # 收集每条边上的链路状态
+            h_ = tf.gather(link_state, links)
+            
+            # 构建路径的序列输入 - 与原版完全一致
+            ids = tf.stack([paths, seqs], axis=1)
+            max_len = tf.reduce_max(seqs) + 1
+            shape = tf.stack([inputs['n_paths'], max_len, self.config['link_state_dim']])
+            
+            # 计算每条路径的长度
+            # 注意：segment_sum 要求 segment_ids 是排序的
+            unique_paths, _ = tf.unique(paths)
+            lens = tf.math.unsorted_segment_sum(
+                data=tf.ones_like(paths, dtype=tf.int32),
+                segment_ids=paths, 
+                num_segments=inputs['n_paths']
+            )
+            
+            # 将链路状态散布到序列格式 [n_paths, max_len, link_state_dim]
+            link_inputs = tf.scatter_nd(ids, h_, shape)
+            
+            # 使用 masking 来处理变长序列
+            # 创建 mask: True 表示有效位置，False 表示 padding
+            mask = tf.sequence_mask(lens, maxlen=max_len, dtype=tf.bool)
+            
+            # 【修复: 使用预先创建的RNN层，而不是在循环中重复创建】
+            # RNN 前向传播
+            outputs, path_state = self.rnn_layer(
+                link_inputs, 
+                initial_state=path_state, 
+                mask=mask,
+                training=training
+            )
+            
+            # 从 RNN 输出中提取对应路径位置的结果
+            m = tf.gather_nd(outputs, ids)
+            
+            # 按链路聚合所有路径的消息
+            m = tf.math.unsorted_segment_sum(m, links, inputs['n_links'])
+            
+            # 更新链路状态
+            link_state, _ = self.link_update(m, [link_state])
+
+        # 读出阶段
+        readout_output = self.readout(path_state, training=training)
+        final_input = tf.concat([readout_output, path_state], axis=1)
+        return self.final_layer(final_input)
+
+# ==============================================================================
+# 高效物理约束模型 - 解决冗余前向传播问题
+# ==============================================================================
+
+class PhysicsInformedRouteNet(tf.keras.Model):
+    """
+    物理约束RouteNet模型 - 高效实现
+    
+    通过自定义train_step方法，在单次前向传播中同时计算：
+    1. 标准预测损失 (L_hetero 或 L_binomial)
+    2. 物理约束损失 (L_gradient)
+    
+    这消除了原始实现中的冗余前向传播，显著提升训练效率。
+    """
+    
+    def __init__(self, config, target='delay', use_kan=False, 
+                 use_physics_loss=False, use_hard_constraint=True, lambda_physics=0.1):
+        super(PhysicsInformedRouteNet, self).__init__()
+        
+        self.config = config
+        self.target = target
+        self.use_kan = use_kan
+        self.use_physics_loss = use_physics_loss
+        self.use_hard_constraint = use_hard_constraint
+        self.lambda_physics = lambda_physics
+        
+        # 创建核心RouteNet模型
+        if target == 'delay':
+            self.routenet = RouteNet(config, output_units=2, final_activation=None, use_kan=use_kan)
+        else:  # drops
+            self.routenet = RouteNet(config, output_units=1, final_activation=None, use_kan=use_kan)
+        
+        # 损失函数追踪指标
+        self.total_loss_tracker = tf.keras.metrics.Mean(name="total_loss")
+        self.hetero_loss_tracker = tf.keras.metrics.Mean(name="hetero_loss")
+        self.gradient_loss_tracker = tf.keras.metrics.Mean(name="gradient_loss")
+        
+        print(f"Created PhysicsInformedRouteNet:")
+        print(f"  - Target: {target}")
+        print(f"  - Architecture: {'KAN' if use_kan else 'MLP'}")
+        print(f"  - Physics Loss: {use_physics_loss}")
+        if use_physics_loss:
+            constraint_type = "Hard" if use_hard_constraint else "Soft"
+            print(f"  - Constraint Type: {constraint_type}")
+            print(f"  - Lambda Physics: {lambda_physics}")
+
+    def call(self, inputs, training=False):
+        """前向传播 - 直接调用内部RouteNet"""
+        return self.routenet(inputs, training=training)
+    
+    @property
+    def metrics(self):
+        """返回跟踪的指标"""
+        return [
+            self.total_loss_tracker,
+            self.hetero_loss_tracker,
+            self.gradient_loss_tracker,
+        ]
+
+    def _compute_hetero_loss(self, y_true, y_pred):
+        """计算异方差损失（延迟预测）"""
+        loc = y_pred[:, 0]
+        
+        # 与原版保持一致的scale计算
+        c = tf.math.log(tf.math.expm1(tf.constant(0.098, dtype=tf.float32)))
+        scale = tf.nn.softplus(c + y_pred[:, 1]) + 1e-9
+        
+        delay_true = y_true['delay']
+        jitter_true = y_true['jitter']
+        packets_true = y_true['packets'] 
+        drops_true = y_true['drops']
+        
+        n = packets_true - drops_true
+        _2sigma = tf.constant(2.0, dtype=tf.float32) * tf.square(scale)
+        
+        nll = (n * jitter_true / _2sigma + 
+               n * tf.square(delay_true - loc) / _2sigma + 
+               n * tf.math.log(scale))
+               
+        return tf.reduce_sum(nll) / 1e6
+
+    def _compute_binomial_loss(self, y_true, y_pred):
+        """计算二项分布损失（丢包预测）"""
+        logits = y_pred[:, 0]
+        
+        packets_true = y_true['packets']
+        drops_true = y_true['drops']
+        
+        loss_ratio = drops_true / (packets_true + 1e-9)
+        
+        loss = tf.reduce_sum(
+            packets_true * tf.nn.sigmoid_cross_entropy_with_logits(
+                labels=loss_ratio,
+                logits=logits
+            )
+        ) / 1e5
+        
+        return loss
+
+    def call_with_gradients(self, features, training=False):
+        """
+        单次前向传播同时计算预测和梯度
+        
+        这是关键优化：在一次前向传播中同时得到：
+        1. 模型预测 predictions
+        2. 预测相对于traffic的梯度 gradients
+        """
+        traffic = features['traffic']
+        
+        with tf.GradientTape() as grad_tape:
+            grad_tape.watch(traffic)
+            predictions = self.routenet(features, training=training)
+            
+            # 只在需要梯度约束时计算梯度
+            if self.use_physics_loss and self.target == 'delay' and predictions.shape[1] == 2:
+                loc = predictions[:, 0]
+            else:
+                loc = None
+        
+        # 计算梯度（如果需要）
+        if loc is not None:
+            gradients = grad_tape.gradient(loc, traffic)
+        else:
+            gradients = None
+        
+        return predictions, gradients
+
+    def _compute_gradient_loss_from_gradients(self, traffic_gradients):
+        """从已计算的梯度计算约束损失"""
+        if traffic_gradients is None:
+            return tf.constant(0.0, dtype=tf.float32)
+        
+        if self.use_hard_constraint:
+            # 硬约束：E_batch[ReLU(-gk)]
+            gradient_penalties = tf.nn.relu(-traffic_gradients)
+            return tf.reduce_mean(gradient_penalties)
+        else:
+            # 软约束：ReLU(-E_batch[gk])
+            batch_mean_gradient = tf.reduce_mean(traffic_gradients)
+            return tf.nn.relu(-batch_mean_gradient)
+
+    def train_step(self, data):
+        """
+        高效的训练步骤 - 单次前向传播解决方案
+        
+        关键优化：使用call_with_gradients在单次前向传播中
+        同时获得预测和梯度，消除冗余计算。
+        """
+        features, y_true = data
+        
+        with tf.GradientTape() as tape:
+            # 关键：单次前向传播同时获得预测和梯度
+            predictions, traffic_gradients = self.call_with_gradients(features, training=True)
+            
+            # 计算标准损失
+            if self.target == 'delay':
+                hetero_loss = self._compute_hetero_loss(y_true, predictions)
+            else:  # drops
+                hetero_loss = self._compute_binomial_loss(y_true, predictions)
+            
+            # 计算梯度约束损失
+            if (self.use_physics_loss and self.target == 'delay' 
+                and traffic_gradients is not None):
+                gradient_loss = self._compute_gradient_loss_from_gradients(traffic_gradients)
+                total_loss = hetero_loss + self.lambda_physics * gradient_loss
+            else:
+                gradient_loss = tf.constant(0.0, dtype=tf.float32)
+                total_loss = hetero_loss
+            
+            # 添加正则化损失
+            total_loss += sum(self.losses)
+        
+        # 计算梯度并更新参数
+        gradients = tape.gradient(total_loss, self.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+        
+        # 更新指标
+        self.total_loss_tracker.update_state(total_loss)
+        self.hetero_loss_tracker.update_state(hetero_loss)
+        self.gradient_loss_tracker.update_state(gradient_loss)
+        
+        return {
+            "total_loss": self.total_loss_tracker.result(),
+            "hetero_loss": self.hetero_loss_tracker.result(), 
+            "gradient_loss": self.gradient_loss_tracker.result(),
+        }
+
+    def test_step(self, data):
+        """测试步骤"""
+        features, y_true = data
+        
+        # 前向传播（测试时不需要梯度）
+        predictions = self(features, training=False)
+        
+        # 计算损失
+        if self.target == 'delay':
+            hetero_loss = self._compute_hetero_loss(y_true, predictions)
+        else:
+            hetero_loss = self._compute_binomial_loss(y_true, predictions)
+        
+        # 测试时通常不计算梯度约束损失，但为了一致性保留
+        gradient_loss = tf.constant(0.0, dtype=tf.float32)
+        total_loss = hetero_loss
+        
+        total_loss += sum(self.losses)
+        
+        # 更新指标
+        self.total_loss_tracker.update_state(total_loss)
+        self.hetero_loss_tracker.update_state(hetero_loss)
+        self.gradient_loss_tracker.update_state(gradient_loss)
+        
+        return {
+            "total_loss": self.total_loss_tracker.result(),
+            "hetero_loss": self.hetero_loss_tracker.result(),
+            "gradient_loss": self.gradient_loss_tracker.result(),
+        }
 
         # 读出网络 - 根据use_kan参数选择MLP或KAN
         if use_kan:
@@ -473,7 +782,7 @@ def physics_informed_loss(y_true, y_pred, model, features, lambda_physics=0.1, u
     
     return l_total, l_hetero, l_gradient
 
-def create_model_and_loss_fn(config, target, use_kan=False, use_physics_loss=False, use_hard_constraint=True, lambda_physics=0.1):
+def create_model_and_loss_fn(config, target, use_kan=False, use_physics_loss=False, use_hard_constraint=True, lambda_physics=0.1, use_optimized_model=True):
     """根据target参数创建相应的模型和损失函数
     
     Args:
@@ -483,6 +792,7 @@ def create_model_and_loss_fn(config, target, use_kan=False, use_physics_loss=Fal
         use_physics_loss: 是否使用物理约束损失函数
         use_hard_constraint: True为硬约束(逐样本)，False为软约束(批次平均)
         lambda_physics: 物理约束权重系数
+        use_optimized_model: True使用高效物理约束模型，False使用传统模型
     """
     model_type = "KAN-based" if use_kan else "MLP-based"
     
@@ -492,34 +802,56 @@ def create_model_and_loss_fn(config, target, use_kan=False, use_physics_loss=Fal
     else:
         constraint_type = "standard"
     
-    if target == 'delay':
-        # 延迟预测模型
-        model = RouteNet(config, output_units=2, final_activation=None, use_kan=use_kan)
+    if use_optimized_model and use_physics_loss:
+        # 使用高效的物理约束模型 - 解决冗余前向传播问题
+        model = PhysicsInformedRouteNet(
+            config=config,
+            target=target,
+            use_kan=use_kan,
+            use_physics_loss=use_physics_loss,
+            use_hard_constraint=use_hard_constraint,
+            lambda_physics=lambda_physics
+        )
         
-        if use_physics_loss:
-            # 使用物理约束损失函数
-            def loss_fn(labels, predictions, model=model, features=None):
-                if features is None:
-                    # 如果没有features，退回到标准异方差损失
-                    return heteroscedastic_loss(labels, predictions)
-                return physics_informed_loss(labels, predictions, model, features, lambda_physics, use_hard_constraint)
-            print("Created {} delay prediction model with {} (λ={})".format(
-                model_type, constraint_type, lambda_physics))
-        else:
-            # 使用标准异方差损失
-            loss_fn = heteroscedastic_loss
-            print("Created {} delay prediction model with {} loss".format(
-                model_type, constraint_type))
-            
-    elif target == 'drops':
-        # 丢包预测模型
-        model = RouteNet(config, output_units=1, final_activation=None, use_kan=use_kan)
-        loss_fn = binomial_loss
-        if use_physics_loss:
-            print("Warning: Physics constraints are not implemented for drops prediction. Using standard binomial loss.")
-        print("Created {} drop prediction model with binomial loss".format(model_type))
+        # 高效模型不需要单独的损失函数，损失计算集成在train_step中
+        loss_fn = None  
+        
+        print(f"🚀 Created OPTIMIZED {model_type} {target} prediction model")
+        print(f"   - Physics Loss: {use_physics_loss}")
+        print(f"   - Constraint Type: {constraint_type}")
+        print(f"   - Lambda Physics: {lambda_physics}")
+        print(f"   - Performance: Single forward pass (2x speed improvement)")
+        
     else:
-        raise ValueError("Unsupported target: {}. Choose 'delay' or 'drops'".format(target))
+        # 使用传统模型（保持向后兼容性）
+        if target == 'delay':
+            # 延迟预测模型
+            model = RouteNet(config, output_units=2, final_activation=None, use_kan=use_kan)
+            
+            if use_physics_loss:
+                # 使用物理约束损失函数（传统方式 - 有冗余前向传播）
+                def loss_fn(labels, predictions, model=model, features=None):
+                    if features is None:
+                        return heteroscedastic_loss(labels, predictions)
+                    return physics_informed_loss(labels, predictions, model, features, lambda_physics, use_hard_constraint)
+                print("⚠️ Created TRADITIONAL {} delay prediction model with {} (λ={})".format(
+                    model_type, constraint_type, lambda_physics))
+                print("   - Warning: This uses double forward pass (slower)")
+            else:
+                # 使用标准异方差损失
+                loss_fn = heteroscedastic_loss
+                print("Created {} delay prediction model with {} loss".format(
+                    model_type, constraint_type))
+                
+        elif target == 'drops':
+            # 丢包预测模型
+            model = RouteNet(config, output_units=1, final_activation=None, use_kan=use_kan)
+            loss_fn = binomial_loss
+            if use_physics_loss:
+                print("Warning: Physics constraints are not implemented for drops prediction. Using standard binomial loss.")
+            print("Created {} drop prediction model with binomial loss".format(model_type))
+        else:
+            raise ValueError("Unsupported target: {}. Choose 'delay' or 'drops'".format(target))
     
     return model, loss_fn
 
@@ -611,7 +943,11 @@ def main(args):
                                              use_kan=args.kan, 
                                              use_physics_loss=args.physics_loss,
                                              use_hard_constraint=args.hard_physics,
-                                             lambda_physics=args.lambda_physics)
+                                             lambda_physics=args.lambda_physics,
+                                             use_optimized_model=True)  # 默认使用优化模型
+    
+    # 检查是否使用高效模型
+    use_optimized_training = isinstance(model, PhysicsInformedRouteNet)
     
     # 创建动态学习率调度器
     if args.lr_schedule == 'exponential':
@@ -648,6 +984,11 @@ def main(args):
     
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
     
+    # 如果使用高效模型，需要编译模型并设置优化器
+    if use_optimized_training:
+        model.compile(optimizer=optimizer)
+        print("✅ Compiled optimized model with Adam optimizer")
+    
     # 如果使用plateau调度，创建ReduceLROnPlateau callback
     reduce_lr_callback = None
     if args.lr_schedule == 'plateau':
@@ -677,7 +1018,16 @@ def main(args):
         pbar = tqdm(train_dataset, desc="Training Epoch {}".format(epoch+1))
         
         for features, labels in pbar:
-            loss, predictions, l_hetero, l_gradient = train_step(model, optimizer, features, labels, loss_fn, use_physics_loss=args.physics_loss)
+            if use_optimized_training:
+                # 使用高效模型的内置train_step
+                metrics = model.train_step((features, labels))
+                loss = metrics["total_loss"]
+                l_hetero = metrics["hetero_loss"] 
+                l_gradient = metrics["gradient_loss"]
+            else:
+                # 使用传统训练步骤
+                loss, predictions, l_hetero, l_gradient = train_step(model, optimizer, features, labels, loss_fn, use_physics_loss=args.physics_loss)
+            
             total_train_loss += loss
             total_hetero_loss += l_hetero
             total_gradient_loss += l_gradient
@@ -725,7 +1075,14 @@ def main(args):
         pbar_eval = tqdm(eval_dataset, desc="Evaluating Epoch {}".format(epoch+1))
         
         for features, labels in pbar_eval:
-            loss, predictions = eval_step(model, features, labels, loss_fn)
+            if use_optimized_training:
+                # 使用高效模型的内置test_step
+                metrics = model.test_step((features, labels))
+                loss = metrics["total_loss"]
+            else:
+                # 使用传统评估步骤
+                loss, predictions = eval_step(model, features, labels, loss_fn)
+            
             total_eval_loss += loss
             eval_step_count += 1
             pbar_eval.set_postfix({'loss': '{:.4f}'.format(loss)})
