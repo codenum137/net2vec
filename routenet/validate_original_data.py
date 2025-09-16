@@ -130,7 +130,7 @@ def analyze_traffic_delay_relationship(samples, output_dir="data_validation"):
     print(f"Traffic-Delay correlation coefficient: {correlation:.4f}")
     
     # 创建综合分析图
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig, axes = plt.subplots(2, 4, figsize=(24, 12))
     
     # 1. 主散点图：Traffic vs Delay
     ax1 = axes[0, 0]
@@ -189,8 +189,50 @@ def analyze_traffic_delay_relationship(samples, output_dir="data_validation"):
     ax4.tick_params(axis='x', rotation=45)
     ax4.grid(True, alpha=0.3)
     
-    # 5. 对数坐标下的关系
+    # 5. 高百分位延迟分析
     ax5 = axes[1, 1]
+    
+    # 计算各流量区间的统计量
+    bin_centers = []
+    median_delays = []
+    p90_delays = []
+    p95_delays = []
+    
+    for i in range(len(traffic_bins)-1):
+        mask = traffic_binned == i
+        if np.sum(mask) > 10:  # 确保有足够的数据点
+            bin_center = (traffic_bins[i] + traffic_bins[i+1]) / 2
+            delays_in_bin = all_delay[mask]
+            
+            bin_centers.append(bin_center)
+            median_delays.append(np.percentile(delays_in_bin, 50))
+            p90_delays.append(np.percentile(delays_in_bin, 90))
+            p95_delays.append(np.percentile(delays_in_bin, 95))
+    
+    if bin_centers:  # 确保有数据可绘制
+        ax5.plot(bin_centers, median_delays, 'o-', label='50th percentile (Median)', 
+                linewidth=2, markersize=6, color='blue')
+        ax5.plot(bin_centers, p90_delays, 's-', label='90th percentile', 
+                linewidth=2, markersize=6, color='orange')
+        ax5.plot(bin_centers, p95_delays, '^-', label='95th percentile', 
+                linewidth=2, markersize=6, color='red')
+        
+        ax5.set_xlabel('Traffic (Mbps)')
+        ax5.set_ylabel('Delay (seconds)')
+        ax5.set_title('High Percentile Delay Analysis\nby Traffic Bins')
+        ax5.legend()
+        ax5.grid(True, alpha=0.3)
+        
+        # 添加数值标注（可选，对于较少的数据点）
+        if len(bin_centers) <= 6:
+            for i, (x, y50, y90, y95) in enumerate(zip(bin_centers, median_delays, p90_delays, p95_delays)):
+                ax5.annotate(f'{y95:.4f}', 
+                           xy=(x, y95), xytext=(5, 5), 
+                           textcoords='offset points', fontsize=8, 
+                           color='red', alpha=0.7)
+    
+    # 6. 对数坐标下的关系
+    ax6 = axes[1, 2]
     # 过滤掉非正值
     positive_traffic = all_traffic[all_traffic > 0]
     positive_delay = all_delay[all_traffic > 0]
@@ -198,15 +240,20 @@ def analyze_traffic_delay_relationship(samples, output_dir="data_validation"):
     positive_traffic = positive_traffic[positive_delay > 0]
     
     if len(positive_traffic) > 0:
-        ax5.loglog(positive_traffic, positive_delay, 'o', alpha=0.6, markersize=3)
-        ax5.set_xlabel('Traffic (Mbps) - Log Scale')
-        ax5.set_ylabel('Delay (seconds) - Log Scale')
-        ax5.set_title('Log-Log Traffic vs Delay')
-        ax5.grid(True, alpha=0.3)
+        ax6.loglog(positive_traffic, positive_delay, 'o', alpha=0.6, markersize=3)
+        ax6.set_xlabel('Traffic (Mbps) - Log Scale')
+        ax6.set_ylabel('Delay (seconds) - Log Scale')
+        ax6.set_title('Log-Log Traffic vs Delay')
+        ax6.grid(True, alpha=0.3)
     
-    # 6. 样本数据统计表
-    ax6 = axes[1, 2]
-    ax6.axis('off')
+    # 7. 样本数据统计表
+    ax7 = axes[1, 3]
+    ax7.axis('off')
+    
+    # 计算高百分位统计信息
+    delay_p90 = np.percentile(all_delay, 90)
+    delay_p95 = np.percentile(all_delay, 95)
+    delay_p99 = np.percentile(all_delay, 99)
     
     stats_text = f"""
     Data Statistics:
@@ -225,6 +272,10 @@ def analyze_traffic_delay_relationship(samples, output_dir="data_validation"):
       Std: {np.std(all_delay):.6f} sec
       Min: {np.min(all_delay):.6f} sec
       Max: {np.max(all_delay):.6f} sec
+      50th percentile: {np.percentile(all_delay, 50):.6f} sec
+      90th percentile: {delay_p90:.6f} sec
+      95th percentile: {delay_p95:.6f} sec
+      99th percentile: {delay_p99:.6f} sec
     
     Correlation Analysis:
       Pearson Correlation: {correlation:.4f}
@@ -236,9 +287,13 @@ def analyze_traffic_delay_relationship(samples, output_dir="data_validation"):
     Trend Analysis:
       Slope: {z[0]:.6f}
       Interpretation: {'✓ Delay increases with traffic' if z[0] > 0 else '✗ Delay decreases with traffic' if z[0] < 0 else '~ No clear trend'}
+      
+    High Percentile Analysis:
+      Traffic bins analyzed: {len(bin_centers) if 'bin_centers' in locals() else 'N/A'}
+      P95/P50 ratio: {delay_p95/np.percentile(all_delay, 50):.2f}
     """
     
-    ax6.text(0.05, 0.95, stats_text, transform=ax6.transAxes, fontsize=11,
+    ax7.text(0.05, 0.95, stats_text, transform=ax7.transAxes, fontsize=10,
              verticalalignment='top', fontfamily='monospace',
              bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
     
@@ -270,7 +325,10 @@ def analyze_traffic_delay_relationship(samples, output_dir="data_validation"):
         f.write(f"   Range: [{np.min(all_delay):.6f}, {np.max(all_delay):.6f}] seconds\n")
         f.write(f"   25th percentile: {np.percentile(all_delay, 25):.6f} seconds\n")
         f.write(f"   50th percentile: {np.percentile(all_delay, 50):.6f} seconds\n")
-        f.write(f"   75th percentile: {np.percentile(all_delay, 75):.6f} seconds\n\n")
+        f.write(f"   75th percentile: {np.percentile(all_delay, 75):.6f} seconds\n")
+        f.write(f"   90th percentile: {np.percentile(all_delay, 90):.6f} seconds\n")
+        f.write(f"   95th percentile: {np.percentile(all_delay, 95):.6f} seconds\n")
+        f.write(f"   99th percentile: {np.percentile(all_delay, 99):.6f} seconds\n\n")
         
         f.write("4. Traffic-Delay Relationship:\n")
         f.write(f"   Pearson correlation coefficient: {correlation:.6f}\n")
@@ -305,8 +363,40 @@ def analyze_traffic_delay_relationship(samples, output_dir="data_validation"):
         else:
             f.write("   Result: ✗ NEGATIVE - Data has serious quality issues!\n")
         
+        # 高百分位分析结果
+        if 'bin_centers' in locals() and bin_centers:
+            f.write(f"\n7. High Percentile Analysis by Traffic Bins:\n")
+            f.write(f"   Number of traffic bins analyzed: {len(bin_centers)}\n")
+            f.write(f"   Traffic bin analysis:\n")
+            f.write("   Traffic Range(Mbps)  |  P50 Delay(s)  |  P90 Delay(s)  |  P95 Delay(s)\n")
+            f.write("   " + "-" * 70 + "\n")
+            
+            for i, (center, p50, p90, p95) in enumerate(zip(bin_centers, median_delays, p90_delays, p95_delays)):
+                bin_start = traffic_bins[i]
+                bin_end = traffic_bins[i+1]
+                f.write(f"   {bin_start:6.1f} - {bin_end:6.1f}     |  {p50:11.6f}  |  {p90:11.6f}  |  {p95:11.6f}\n")
+            
+            # 计算趋势
+            if len(bin_centers) >= 3:
+                p95_slope = np.polyfit(bin_centers, p95_delays, 1)[0]
+                p90_slope = np.polyfit(bin_centers, p90_delays, 1)[0]
+                p50_slope = np.polyfit(bin_centers, median_delays, 1)[0]
+                
+                f.write(f"\n   Trend Analysis (slope per Mbps traffic increase):\n")
+                f.write(f"     P50 (median) slope: {p50_slope:.8f} sec/Mbps\n")
+                f.write(f"     P90 slope: {p90_slope:.8f} sec/Mbps\n")
+                f.write(f"     P95 slope: {p95_slope:.8f} sec/Mbps\n")
+                f.write(f"   \n")
+                f.write(f"   High percentile interpretation:\n")
+                if p95_slope > p50_slope * 1.5:
+                    f.write("     ✓ High percentiles show steeper increase - expected behavior\n")
+                    f.write("     ✓ Network congestion effects are captured in tail latencies\n")
+                else:
+                    f.write("     ~ High percentiles don't show much steeper increase\n")
+                    f.write("     ~ May indicate uniform delay patterns or data quality issues\n")
+        
         # 样本详细数据（前100个点）
-        f.write(f"\n7. Sample Data Points (first 100):\n")
+        f.write(f"\n8. Sample Data Points (first 100):\n")
         f.write("-" * 50 + "\n")
         f.write("Traffic(Mbps)  Delay(seconds)  Capacity(Mbps)\n")
         f.write("-" * 50 + "\n")

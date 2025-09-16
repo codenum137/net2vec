@@ -39,23 +39,43 @@ class ExperimentRunner:
         
         return config
     
-    def validate_model_paths(self):
-        """验证模型路径是否存在"""
+    def get_full_model_path(self, model_config):
+        """获取完整的模型路径"""
+        models_base_dir = self.config['global_settings']['models_base_dir']
+        delay_model_dir = model_config['delay_model_dir']
+        return os.path.join(models_base_dir, delay_model_dir)
+    
+    def validate_model_paths(self, selected_models=None):
+        """验证模型路径是否存在，返回存在的模型和缺失的模型"""
         missing_models = []
+        existing_models = {}
         
-        for model_name, model_config in self.config['models'].items():
-            model_dir = model_config['delay_model_dir']
+        # 如果指定了选中的模型，只验证这些模型
+        if selected_models:
+            models_to_validate = {k: v for k, v in self.config['models'].items() if k in selected_models}
+            validation_scope = f"选中的 {len(models_to_validate)} 个模型"
+        else:
+            models_to_validate = self.config['models']
+            validation_scope = f"所有 {len(models_to_validate)} 个模型"
+        
+        print(f"🔍 正在验证{validation_scope}的路径...")
+        
+        for model_name, model_config in models_to_validate.items():
+            model_dir = self.get_full_model_path(model_config)
             if not os.path.exists(model_dir):
                 missing_models.append(f"{model_name}: {model_dir}")
+            else:
+                existing_models[model_name] = model_config
         
+        # 报告验证结果
+        print(f"✅ 发现 {len(existing_models)} 个可用模型")
         if missing_models:
-            print("⚠️  以下模型路径不存在:")
+            print(f"⚠️  以下 {len(missing_models)} 个模型路径不存在:")
             for missing in missing_models:
                 print(f"   - {missing}")
-            return False
+            print(f"🚀 将继续运行可用的 {len(existing_models)} 个模型")
         
-        print("✅ 所有模型路径验证通过")
-        return True
+        return existing_models, missing_models
     
     def build_command(self, experiment_type, model_name, model_config):
         """构建实验命令"""
@@ -73,10 +93,13 @@ class ExperimentRunner:
             experiment_type
         )
         
+        # 获取完整模型路径
+        full_model_path = self.get_full_model_path(model_config)
+        
         # 构建参数
         if experiment_type == "evaluate":
             cmd.extend([
-                "--delay_model_dir", model_config['delay_model_dir'],
+                "--delay_model_dir", full_model_path,
                 "--nsfnet_test_dir", global_settings['nsfnet_test_dir'],
                 "--gbn_test_dir", global_settings['gbn_test_dir'],
                 "--output_dir", output_dir,
@@ -88,7 +111,7 @@ class ExperimentRunner:
                 
         elif experiment_type == "gradient":
             cmd.extend([
-                "--model_dir", model_config['delay_model_dir'],
+                "--model_dir", full_model_path,
                 "--output_dir", output_dir,
                 "--target", "delay",
                 "--traffic_min", str(global_settings['traffic_min']),
@@ -100,7 +123,7 @@ class ExperimentRunner:
                 
         elif experiment_type == "numerical":
             cmd.extend([
-                "--model_dir", model_config['delay_model_dir'],
+                "--model_dir", full_model_path,
                 "--nsfnet_test_dir", global_settings['nsfnet_test_dir'],
                 "--gbn_test_dir", global_settings['gbn_test_dir'],
                 "--output_dir", output_dir,
@@ -197,11 +220,14 @@ class ExperimentRunner:
     
     def run_experiments(self, selected_models=None, selected_experiments=None, parallel=False, max_workers=4):
         """运行实验"""
-        # 筛选模型
-        if selected_models:
-            models_to_run = {k: v for k, v in self.config['models'].items() if k in selected_models}
-        else:
-            models_to_run = self.config['models']
+        # 验证模型路径，获取可用的模型
+        existing_models, missing_models = self.validate_model_paths(selected_models)
+        
+        if not existing_models:
+            print("❌ 没有可用的模型，无法运行实验")
+            return
+        
+        models_to_run = existing_models
         
         # 筛选实验类型
         if selected_experiments:
@@ -303,13 +329,13 @@ def main():
         # 初始化运行器
         runner = ExperimentRunner(args.config)
         
-        # 验证模型路径
-        if not runner.validate_model_paths():
-            print("❌ 模型路径验证失败，请检查配置文件")
-            return 1
-        
         if args.validate_only:
-            print("✅ 配置验证完成")
+            # 仅验证配置
+            existing_models, missing_models = runner.validate_model_paths(selected_models=args.models)
+            if missing_models:
+                print("⚠️  发现缺失的模型，但有可用模型可以运行")
+            else:
+                print("✅ 所有模型路径验证通过")
             return 0
         
         # 运行实验
