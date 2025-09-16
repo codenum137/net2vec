@@ -342,17 +342,23 @@ class RouteNet(tf.keras.Model):
 
 class PhysicsInformedRouteNet(tf.keras.Model):
     """
-    物理约束RouteNet模型 - 高效实现
+    物理约束RouteNet模型 - 高效实现 + 课程学习
     
     通过自定义train_step方法，在单次前向传播中同时计算：
     1. 标准预测损失 (L_hetero 或 L_binomial)
     2. 物理约束损失 (L_gradient)
     
+    支持课程学习策略：
+    - 热身期：lambda=0，专注数据拟合
+    - 增长期：lambda线性增长到max_lambda
+    - 保持期：lambda保持在max_lambda
+    
     这消除了原始实现中的冗余前向传播，显著提升训练效率。
     """
     
     def __init__(self, config, target='delay', use_kan=False, 
-                 use_physics_loss=False, use_hard_constraint=True, lambda_physics=0.1):
+                 use_physics_loss=False, use_hard_constraint=True, lambda_physics=0.1,
+                 use_curriculum=False, warmup_epochs=5, ramp_epochs=10, max_lambda=0.1):
         super(PhysicsInformedRouteNet, self).__init__()
         
         self.config = config
@@ -360,7 +366,17 @@ class PhysicsInformedRouteNet(tf.keras.Model):
         self.use_kan = use_kan
         self.use_physics_loss = use_physics_loss
         self.use_hard_constraint = use_hard_constraint
-        self.lambda_physics = lambda_physics
+        
+        # 课程学习参数
+        self.use_curriculum = use_curriculum
+        if use_curriculum:
+            self.warmup_epochs = warmup_epochs
+            self.ramp_epochs = ramp_epochs
+            self.max_lambda = max_lambda
+            self.lambda_physics = tf.Variable(0.0, trainable=False, name='lambda_physics')
+            self.current_epoch = tf.Variable(0, trainable=False, name='current_epoch', dtype=tf.int32)
+        else:
+            self.lambda_physics = lambda_physics
         
         # 创建核心RouteNet模型
         if target == 'delay':
@@ -373,6 +389,10 @@ class PhysicsInformedRouteNet(tf.keras.Model):
         self.hetero_loss_tracker = tf.keras.metrics.Mean(name="hetero_loss")
         self.gradient_loss_tracker = tf.keras.metrics.Mean(name="gradient_loss")
         
+        # 课程学习追踪指标
+        if self.use_curriculum:
+            self.lambda_tracker = tf.keras.metrics.Mean(name="lambda_physics_value")
+        
         print(f"Created PhysicsInformedRouteNet:")
         print(f"  - Target: {target}")
         print(f"  - Architecture: {'KAN' if use_kan else 'MLP'}")
@@ -380,7 +400,14 @@ class PhysicsInformedRouteNet(tf.keras.Model):
         if use_physics_loss:
             constraint_type = "Hard" if use_hard_constraint else "Soft"
             print(f"  - Constraint Type: {constraint_type}")
-            print(f"  - Lambda Physics: {lambda_physics}")
+            if use_curriculum:
+                print(f"  - Curriculum Learning: Enabled")
+                print(f"    * Warmup Epochs: {warmup_epochs}")
+                print(f"    * Ramp-up Epochs: {ramp_epochs}")
+                print(f"    * Max Lambda: {max_lambda}")
+                print(f"    * Strategy: Linear Ramp-up")
+            else:
+                print(f"  - Lambda Physics: {lambda_physics}")
 
     def call(self, inputs, training=False):
         """前向传播 - 直接调用内部RouteNet"""
@@ -389,11 +416,69 @@ class PhysicsInformedRouteNet(tf.keras.Model):
     @property
     def metrics(self):
         """返回跟踪的指标"""
-        return [
+        metrics = [
             self.total_loss_tracker,
             self.hetero_loss_tracker,
             self.gradient_loss_tracker,
         ]
+        if self.use_curriculum:
+            metrics.append(self.lambda_tracker)
+        return metrics
+
+    def update_curriculum_lambda(self, epoch):
+        """
+        课程学习：动态更新lambda_physics值
+        
+        策略：线性增长 (Linear Ramp-up)
+        - 热身期 (0 <= epoch < warmup_epochs): lambda = 0
+        - 增长期 (warmup_epochs <= epoch < warmup_epochs + ramp_epochs): 线性增长
+        - 保持期 (epoch >= warmup_epochs + ramp_epochs): lambda = max_lambda
+        
+        Args:
+            epoch: 当前训练轮数（从0开始）
+        """
+        if not self.use_curriculum:
+            return
+            
+        epoch = tf.cast(epoch, tf.float32)
+        warmup_epochs = tf.cast(self.warmup_epochs, tf.float32)
+        ramp_epochs = tf.cast(self.ramp_epochs, tf.float32)
+        
+        # 热身期：lambda = 0
+        warmup_condition = epoch < warmup_epochs
+        
+        # 增长期：线性增长
+        ramp_start = warmup_epochs
+        ramp_end = warmup_epochs + ramp_epochs
+        ramp_condition = tf.logical_and(epoch >= ramp_start, epoch < ramp_end)
+        
+        # 计算线性增长的lambda值
+        # progress = (epoch - warmup_epochs) / ramp_epochs
+        # lambda = max_lambda * progress
+        progress = (epoch - ramp_start) / ramp_epochs
+        ramp_lambda = self.max_lambda * progress
+        
+        # 保持期：lambda = max_lambda
+        hold_condition = epoch >= ramp_end
+        
+        # 使用tf.case进行条件选择
+        new_lambda = tf.case([
+            (warmup_condition, lambda: 0.0),
+            (ramp_condition, lambda: ramp_lambda),
+            (hold_condition, lambda: self.max_lambda)
+        ], exclusive=True)
+        
+        self.lambda_physics.assign(new_lambda)
+        self.current_epoch.assign(tf.cast(epoch, tf.int32))
+        
+        return new_lambda
+
+    def get_current_lambda(self):
+        """获取当前的lambda_physics值"""
+        if self.use_curriculum:
+            return self.lambda_physics.numpy()
+        else:
+            return self.lambda_physics
 
     def _compute_hetero_loss(self, y_true, y_pred):
         """计算异方差损失（延迟预测）"""
@@ -479,12 +564,17 @@ class PhysicsInformedRouteNet(tf.keras.Model):
 
     def train_step(self, data):
         """
-        高效的训练步骤 - 单次前向传播解决方案
+        高效的训练步骤 - 单次前向传播解决方案 + 课程学习
         
         关键优化：使用call_with_gradients在单次前向传播中
         同时获得预测和梯度，消除冗余计算。
+        
+        课程学习：动态调整物理约束权重，实现平滑训练过程。
         """
         features, y_true = data
+        
+        # 获取当前lambda值（课程学习或固定值）
+        current_lambda = self.lambda_physics if self.use_curriculum else self.lambda_physics
         
         with tf.GradientTape() as tape:
             # 关键：单次前向传播同时获得预测和梯度
@@ -500,7 +590,7 @@ class PhysicsInformedRouteNet(tf.keras.Model):
             if (self.use_physics_loss and self.target == 'delay' 
                 and traffic_gradients is not None):
                 gradient_loss = self._compute_gradient_loss_from_gradients(traffic_gradients)
-                total_loss = hetero_loss + self.lambda_physics * gradient_loss
+                total_loss = hetero_loss + current_lambda * gradient_loss
             else:
                 gradient_loss = tf.constant(0.0, dtype=tf.float32)
                 total_loss = hetero_loss
@@ -517,11 +607,21 @@ class PhysicsInformedRouteNet(tf.keras.Model):
         self.hetero_loss_tracker.update_state(hetero_loss)
         self.gradient_loss_tracker.update_state(gradient_loss)
         
-        return {
+        # 更新课程学习lambda追踪
+        if self.use_curriculum:
+            self.lambda_tracker.update_state(current_lambda)
+        
+        result = {
             "total_loss": self.total_loss_tracker.result(),
             "hetero_loss": self.hetero_loss_tracker.result(), 
             "gradient_loss": self.gradient_loss_tracker.result(),
         }
+        
+        # 添加lambda追踪到返回结果
+        if self.use_curriculum:
+            result["lambda_physics"] = self.lambda_tracker.result()
+            
+        return result
 
     def test_step(self, data):
         """测试步骤"""
@@ -552,106 +652,6 @@ class PhysicsInformedRouteNet(tf.keras.Model):
             "hetero_loss": self.hetero_loss_tracker.result(),
             "gradient_loss": self.gradient_loss_tracker.result(),
         }
-
-        # 读出网络 - 根据use_kan参数选择MLP或KAN
-        if use_kan:
-            print("Using KAN (Kolmogorov-Arnold Networks) for readout layers")
-            self.readout = tf.keras.Sequential([
-                KANLayer(
-                    config['readout_units'],
-                    grid_size=5,
-                    spline_order=3,
-                    name='kan_layer_{}'.format(i)
-                ) for i in range(config['readout_layers'])
-            ])
-        else:
-            print("Using traditional MLP for readout layers")
-            # 【修复2: 在MLP版本中添加Dropout层】
-            readout_layers = []
-            for _ in range(config['readout_layers']):
-                readout_layers.append(
-                    tf.keras.layers.Dense(
-                        config['readout_units'],
-                        activation='selu',
-                        kernel_regularizer=tf.keras.regularizers.l2(config['l2'])
-                    )
-                )
-                # 添加Dropout层，使用与原版一致的dropout_rate
-                readout_layers.append(tf.keras.layers.Dropout(rate=0.5))  # 原版默认dropout_rate=0.5
-                
-            self.readout = tf.keras.Sequential(readout_layers)
-        
-        # 最终输出层，支持不同的激活函数
-        self.final_layer = tf.keras.layers.Dense(
-            output_units,
-            activation=final_activation,
-            kernel_regularizer=tf.keras.regularizers.l2(config['l2_2'])
-        )
-
-    def call(self, inputs, training=False):
-        # 初始化状态
-        link_state = tf.concat([
-            tf.expand_dims(inputs['capacities'], axis=1),
-            tf.zeros([inputs['n_links'], self.config['link_state_dim'] - 1])
-        ], axis=1)
-        
-        path_state = tf.concat([
-            tf.expand_dims(inputs['traffic'], axis=1),
-            tf.zeros([inputs['n_paths'], self.config['path_state_dim'] - 1])
-        ], axis=1)
-
-        links = inputs['links']
-        paths = inputs['paths']
-        seqs = inputs['sequences']
-        
-        # T 轮消息传递（使用与原版相同的 RNN 处理）
-        for _ in range(self.config['T']):
-            # 收集每条边上的链路状态
-            h_ = tf.gather(link_state, links)
-            
-            # 构建路径的序列输入 - 与原版完全一致
-            ids = tf.stack([paths, seqs], axis=1)
-            max_len = tf.reduce_max(seqs) + 1
-            shape = tf.stack([inputs['n_paths'], max_len, self.config['link_state_dim']])
-            
-            # 计算每条路径的长度
-            # 注意：segment_sum 要求 segment_ids 是排序的
-            unique_paths, _ = tf.unique(paths)
-            lens = tf.math.unsorted_segment_sum(
-                data=tf.ones_like(paths, dtype=tf.int32),
-                segment_ids=paths, 
-                num_segments=inputs['n_paths']
-            )
-            
-            # 将链路状态散布到序列格式 [n_paths, max_len, link_state_dim]
-            link_inputs = tf.scatter_nd(ids, h_, shape)
-            
-            # 使用 masking 来处理变长序列
-            # 创建 mask: True 表示有效位置，False 表示 padding
-            mask = tf.sequence_mask(lens, maxlen=max_len, dtype=tf.bool)
-            
-            # 【修复: 使用预先创建的RNN层，而不是在循环中重复创建】
-            # RNN 前向传播
-            outputs, path_state = self.rnn_layer(
-                link_inputs, 
-                initial_state=path_state, 
-                mask=mask,
-                training=training
-            )
-            
-            # 从 RNN 输出中提取对应路径位置的结果
-            m = tf.gather_nd(outputs, ids)
-            
-            # 按链路聚合所有路径的消息
-            m = tf.math.unsorted_segment_sum(m, links, inputs['n_links'])
-            
-            # 更新链路状态
-            link_state, _ = self.link_update(m, [link_state])
-
-        # 读出阶段
-        readout_output = self.readout(path_state, training=training)
-        final_input = tf.concat([readout_output, path_state], axis=1)
-        return self.final_layer(final_input)
 
 # ==============================================================================
 # 3. 损失函数 (支持延迟和丢包两种任务 + 物理约束)
@@ -782,7 +782,9 @@ def physics_informed_loss(y_true, y_pred, model, features, lambda_physics=0.1, u
     
     return l_total, l_hetero, l_gradient
 
-def create_model_and_loss_fn(config, target, use_kan=False, use_physics_loss=False, use_hard_constraint=True, lambda_physics=0.1, use_optimized_model=True):
+def create_model_and_loss_fn(config, target, use_kan=False, use_physics_loss=False, use_hard_constraint=True, 
+                           lambda_physics=0.1, use_optimized_model=True, use_curriculum=False, 
+                           warmup_epochs=5, ramp_epochs=10, max_lambda=1.0):
     """根据target参数创建相应的模型和损失函数
     
     Args:
@@ -791,8 +793,12 @@ def create_model_and_loss_fn(config, target, use_kan=False, use_physics_loss=Fal
         use_kan: 是否使用KAN架构
         use_physics_loss: 是否使用物理约束损失函数
         use_hard_constraint: True为硬约束(逐样本)，False为软约束(批次平均)
-        lambda_physics: 物理约束权重系数
+        lambda_physics: 物理约束权重系数（固定值或课程学习的最大值）
         use_optimized_model: True使用高效物理约束模型，False使用传统模型
+        use_curriculum: 是否启用课程学习
+        warmup_epochs: 热身期轮数
+        ramp_epochs: 增长期轮数
+        max_lambda: 课程学习的最大lambda值
     """
     model_type = "KAN-based" if use_kan else "MLP-based"
     
@@ -810,7 +816,11 @@ def create_model_and_loss_fn(config, target, use_kan=False, use_physics_loss=Fal
             use_kan=use_kan,
             use_physics_loss=use_physics_loss,
             use_hard_constraint=use_hard_constraint,
-            lambda_physics=lambda_physics
+            lambda_physics=lambda_physics,
+            use_curriculum=use_curriculum,
+            warmup_epochs=warmup_epochs,
+            ramp_epochs=ramp_epochs,
+            max_lambda=max_lambda
         )
         
         # 高效模型不需要单独的损失函数，损失计算集成在train_step中
@@ -819,7 +829,10 @@ def create_model_and_loss_fn(config, target, use_kan=False, use_physics_loss=Fal
         print(f"🚀 Created OPTIMIZED {model_type} {target} prediction model")
         print(f"   - Physics Loss: {use_physics_loss}")
         print(f"   - Constraint Type: {constraint_type}")
-        print(f"   - Lambda Physics: {lambda_physics}")
+        if use_curriculum:
+            print(f"   - Curriculum Learning: Enabled (max_lambda={max_lambda})")
+        else:
+            print(f"   - Lambda Physics: {lambda_physics}")
         print(f"   - Performance: Single forward pass (2x speed improvement)")
         
     else:
@@ -944,7 +957,11 @@ def main(args):
                                              use_physics_loss=args.physics_loss,
                                              use_hard_constraint=args.hard_physics,
                                              lambda_physics=args.lambda_physics,
-                                             use_optimized_model=True)  # 默认使用优化模型
+                                             use_optimized_model=True,  # 默认使用优化模型
+                                             use_curriculum=args.curriculum,
+                                             warmup_epochs=args.warmup_epochs,
+                                             ramp_epochs=args.ramp_epochs,
+                                             max_lambda=args.max_lambda)
     
     # 检查是否使用高效模型
     use_optimized_training = isinstance(model, PhysicsInformedRouteNet)
@@ -1010,10 +1027,28 @@ def main(args):
     for epoch in range(args.epochs):
         print("\nEpoch {}/{}".format(epoch + 1, args.epochs))
         
+        # 课程学习：在每个epoch开始时更新lambda_physics
+        if use_optimized_training and hasattr(model, 'use_curriculum') and model.use_curriculum:
+            new_lambda = model.update_curriculum_lambda(epoch)
+            current_lambda = model.get_current_lambda()
+            
+            # 确定当前训练阶段
+            if epoch < model.warmup_epochs:
+                stage = "Warmup"
+            elif epoch < model.warmup_epochs + model.ramp_epochs:
+                stage = "Ramp-up"
+                progress = (epoch - model.warmup_epochs) / model.ramp_epochs * 100
+                stage += f" ({progress:.1f}%)"
+            else:
+                stage = "Hold"
+                
+            print(f"📚 Curriculum Learning - Epoch {epoch+1}: λ={current_lambda:.4f} [{stage}]")
+        
         # 训练
         total_train_loss = 0.0
         total_hetero_loss = 0.0
         total_gradient_loss = 0.0
+        total_lambda_physics = 0.0
         train_step_count = 0
         pbar = tqdm(train_dataset, desc="Training Epoch {}".format(epoch+1))
         
@@ -1031,6 +1066,11 @@ def main(args):
             total_train_loss += loss
             total_hetero_loss += l_hetero
             total_gradient_loss += l_gradient
+            
+            # 课程学习lambda追踪
+            if use_optimized_training and "lambda_physics" in metrics:
+                total_lambda_physics += metrics["lambda_physics"]
+            
             train_step_count += 1
             global_step += 1
             
@@ -1041,6 +1081,9 @@ def main(args):
                     if args.physics_loss:
                         tf.summary.scalar('batch_hetero_loss', l_hetero, step=global_step)
                         tf.summary.scalar('batch_gradient_loss', l_gradient, step=global_step)
+                        # 记录课程学习lambda值
+                        if use_optimized_training and hasattr(model, 'use_curriculum') and model.use_curriculum:
+                            tf.summary.scalar('lambda_physics', model.get_current_lambda(), step=global_step)
                     # 记录当前学习率
                     current_lr = optimizer.learning_rate
                     if hasattr(current_lr, 'numpy'):
@@ -1061,6 +1104,7 @@ def main(args):
         avg_train_loss = total_train_loss / train_step_count
         avg_hetero_loss = total_hetero_loss / train_step_count 
         avg_gradient_loss = total_gradient_loss / train_step_count
+        avg_lambda_physics = total_lambda_physics / train_step_count if total_lambda_physics > 0 else 0
 
         # 记录训练的平均损失
         with train_summary_writer.as_default():
@@ -1068,6 +1112,9 @@ def main(args):
             if args.physics_loss:
                 tf.summary.scalar('epoch_hetero_loss', avg_hetero_loss, step=epoch + 1)
                 tf.summary.scalar('epoch_gradient_loss', avg_gradient_loss, step=epoch + 1)
+                # 记录课程学习的epoch级lambda值
+                if use_optimized_training and hasattr(model, 'use_curriculum') and model.use_curriculum:
+                    tf.summary.scalar('epoch_lambda_physics', model.get_current_lambda(), step=epoch + 1)
 
         # 评估
         total_eval_loss = 0.0
@@ -1120,9 +1167,13 @@ def main(args):
 
         # 输出epoch结果
         if args.physics_loss:
-            print("Epoch {} finished. Total Loss: {:.4f} (Hetero: {:.4f}, Gradient: {:.4f}), Eval Loss: {:.4f}, LR: {:.6f}".format(
-                epoch + 1, avg_train_loss, avg_hetero_loss, avg_gradient_loss, avg_eval_loss,
-                optimizer.learning_rate.numpy() if hasattr(optimizer.learning_rate, 'numpy') else optimizer.learning_rate))
+            lr_value = optimizer.learning_rate.numpy() if hasattr(optimizer.learning_rate, 'numpy') else optimizer.learning_rate
+            if use_optimized_training and hasattr(model, 'use_curriculum') and model.use_curriculum:
+                print("Epoch {} finished. Total Loss: {:.4f} (Hetero: {:.4f}, Gradient: {:.4f}), Eval Loss: {:.4f}, LR: {:.6f}, λ: {:.4f}".format(
+                    epoch + 1, avg_train_loss, avg_hetero_loss, avg_gradient_loss, avg_eval_loss, lr_value, model.get_current_lambda()))
+            else:
+                print("Epoch {} finished. Total Loss: {:.4f} (Hetero: {:.4f}, Gradient: {:.4f}), Eval Loss: {:.4f}, LR: {:.6f}".format(
+                    epoch + 1, avg_train_loss, avg_hetero_loss, avg_gradient_loss, avg_eval_loss, lr_value))
         else:
             print("Epoch {} finished. Avg Train Loss: {:.4f}, Avg Eval Loss: {:.4f}, LR: {:.6f}".format(
                 epoch + 1, avg_train_loss, avg_eval_loss, 
@@ -1196,6 +1247,16 @@ if __name__ == '__main__':
                       help='Use hard constraint (per-sample) instead of soft constraint (batch-average). Only effective when --physics_loss is enabled.')
     parser.add_argument('--lambda_physics', type=float, default=0.1,
                       help='Weight coefficient for physics constraint term (default: 0.1)')
+    
+    # 课程学习参数
+    parser.add_argument('--curriculum', action='store_true',
+                      help='Enable curriculum learning for physics constraint (lambda ramp-up)')
+    parser.add_argument('--warmup_epochs', type=int, default=5,
+                      help='Number of warmup epochs (lambda=0) for curriculum learning (default: 5)')
+    parser.add_argument('--ramp_epochs', type=int, default=10,
+                      help='Number of ramp-up epochs for curriculum learning (default: 10)')
+    parser.add_argument('--max_lambda', type=float, default=1.0,
+                      help='Maximum lambda value for curriculum learning (default: 1.0)')
     
     # 用于cosine和polynomial调度的steps_per_epoch估计
     parser.add_argument('--steps_per_epoch', type=int, default=100,

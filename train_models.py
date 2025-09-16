@@ -19,7 +19,7 @@ class ModelTrainer:
         self.train_script = self.base_dir / "routenet" / "routenet_tf2.py"
         self.train_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "train"
         self.eval_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "evaluate"
-        self.models_base_dir = self.base_dir / "fixed_model/0915"
+        self.models_base_dir = self.base_dir / "fixed_model/"
         self.force_retrain = force_retrain  # 是否强制重新训练已存在的模型
         
         # 训练配置
@@ -34,31 +34,56 @@ class ModelTrainer:
             # 不使用物理约束的配置
             {"type": "mlp", "use_kan": False, "physics": "none", "use_physics_loss": False, "use_hard_constraint": False},
             {"type": "kan", "use_kan": True, "physics": "none", "use_physics_loss": False, "use_hard_constraint": False},
-            # 使用物理约束的配置
+            # 使用物理约束的配置 - 传统固定lambda
             {"type": "mlp", "use_kan": False, "physics": "soft", "use_physics_loss": True, "use_hard_constraint": False},
             {"type": "mlp", "use_kan": False, "physics": "hard", "use_physics_loss": True, "use_hard_constraint": True},
             {"type": "kan", "use_kan": True, "physics": "soft", "use_physics_loss": True, "use_hard_constraint": False},
             {"type": "kan", "use_kan": True, "physics": "hard", "use_physics_loss": True, "use_hard_constraint": True},
+            # 使用物理约束的配置 - 课程学习
+            {"type": "mlp", "use_kan": False, "physics": "soft_cl", "use_physics_loss": True, "use_hard_constraint": False, "use_curriculum": True},
+            {"type": "mlp", "use_kan": False, "physics": "hard_cl", "use_physics_loss": True, "use_hard_constraint": True, "use_curriculum": True},
+            {"type": "kan", "use_kan": True, "physics": "soft_cl", "use_physics_loss": True, "use_hard_constraint": False, "use_curriculum": True},
+            {"type": "kan", "use_kan": True, "physics": "hard_cl", "use_physics_loss": True, "use_hard_constraint": True, "use_curriculum": True},
         ]
         
         # lambda_physics参数
-        lambda_values = [0.1,0.5, 1.0]
+        lambda_values = [0.1, 0.5, 1.0]
         
         for model_config in model_configs:
             if model_config["use_physics_loss"]:
                 # 使用物理约束的配置：生成多个lambda值
                 for lambda_val in lambda_values:
-                    config = {
-                        "name": f"{model_config['type']}_{model_config['physics']}_{lambda_val}",
-                        "model_type": model_config["type"],
-                        "use_kan": model_config["use_kan"],
-                        "physics_type": model_config["physics"],
-                        "use_physics_loss": model_config["use_physics_loss"],
-                        "use_hard_constraint": model_config["use_hard_constraint"],
-                        "lambda_physics": lambda_val,
-                        "model_dir": self._get_model_dir(model_config, lambda_val),
-                    }
-                    configs.append(config)
+                    # 课程学习配置
+                    if model_config.get("use_curriculum", False):
+                        config = {
+                            "name": f"{model_config['type']}_{model_config['physics']}_{lambda_val}",
+                            "model_type": model_config["type"],
+                            "use_kan": model_config["use_kan"],
+                            "physics_type": model_config["physics"],
+                            "use_physics_loss": model_config["use_physics_loss"],
+                            "use_hard_constraint": model_config["use_hard_constraint"],
+                            "lambda_physics": lambda_val,  # 这将作为max_lambda使用
+                            "use_curriculum": True,
+                            "warmup_epochs": 5,  # 热身期默认5轮
+                            "ramp_epochs": 10,   # 增长期默认10轮
+                            "max_lambda": lambda_val,  # 最大lambda值
+                            "model_dir": self._get_model_dir(model_config, lambda_val),
+                        }
+                        configs.append(config)
+                    else:
+                        # 传统固定lambda配置
+                        config = {
+                            "name": f"{model_config['type']}_{model_config['physics']}_{lambda_val}",
+                            "model_type": model_config["type"],
+                            "use_kan": model_config["use_kan"],
+                            "physics_type": model_config["physics"],
+                            "use_physics_loss": model_config["use_physics_loss"],
+                            "use_hard_constraint": model_config["use_hard_constraint"],
+                            "lambda_physics": lambda_val,
+                            "use_curriculum": False,
+                            "model_dir": self._get_model_dir(model_config, lambda_val),
+                        }
+                        configs.append(config)
             else:
                 # 不使用物理约束的配置：只生成一个配置
                 config = {
@@ -69,6 +94,7 @@ class ModelTrainer:
                     "use_physics_loss": model_config["use_physics_loss"],
                     "use_hard_constraint": model_config["use_hard_constraint"],
                     "lambda_physics": 0.0,  # 不使用物理约束时lambda值无意义
+                    "use_curriculum": False,
                     "model_dir": self._get_model_dir(model_config, None),
                 }
                 configs.append(config)
@@ -104,7 +130,19 @@ class ModelTrainer:
         
         # 添加物理损失相关参数（仅在使用物理约束时）
         if config["use_physics_loss"]:
-            cmd.extend(["--physics_loss", "--lambda_physics", str(config["lambda_physics"])])
+            cmd.extend(["--physics_loss"])
+            
+            # 课程学习参数
+            if config.get("use_curriculum", False):
+                cmd.extend([
+                    "--curriculum",
+                    "--warmup_epochs", str(config.get("warmup_epochs", 5)),
+                    "--ramp_epochs", str(config.get("ramp_epochs", 10)),
+                    "--max_lambda", str(config.get("max_lambda", config["lambda_physics"]))
+                ])
+            else:
+                # 传统固定lambda
+                cmd.extend(["--lambda_physics", str(config["lambda_physics"])])
             
             # 添加约束类型参数
             if config["use_hard_constraint"]:
@@ -121,7 +159,15 @@ class ModelTrainer:
         print(f"\n{'='*60}")
         print(f"🚀 开始训练模型: {config['name']}")
         print(f"📁 模型目录: {config['model_dir']}")
-        print(f"⚙️  配置: {config['model_type'].upper()}, {config['physics_type']}, λ={config['lambda_physics']}")
+        
+        # 构建配置描述
+        config_desc = f"{config['model_type'].upper()}, {config['physics_type']}"
+        if config.get("use_curriculum", False):
+            config_desc += f", 课程学习(max_λ={config.get('max_lambda', config['lambda_physics'])})"
+        else:
+            config_desc += f", λ={config['lambda_physics']}"
+        
+        print(f"⚙️  配置: {config_desc}")
         print(f"{'='*60}")
         
         # 检查模型是否已存在（根据模型类型选择正确的文件名）
@@ -317,12 +363,21 @@ class ModelTrainer:
             "model_type": config["model_type"],
             "physics_type": config["physics_type"],
             "lambda_physics": config["lambda_physics"],
+            "use_curriculum": config.get("use_curriculum", False),
             "success": success,
             "duration": duration,
             "timestamp": datetime.now().isoformat(),
             "stdout": stdout,
             "stderr": stderr
         }
+        
+        # 添加课程学习相关参数
+        if config.get("use_curriculum", False):
+            result.update({
+                "warmup_epochs": config.get("warmup_epochs", 5),
+                "ramp_epochs": config.get("ramp_epochs", 10),
+                "max_lambda": config.get("max_lambda", config["lambda_physics"])
+            })
         
         # 保存到模型目录
         result_file = config["model_dir"] / "training_result.json"
@@ -380,8 +435,8 @@ class ModelTrainer:
                 
             # 训练间隔
             if i < len(configs_to_train):
-                print(f"⏸️  等待 10 秒后开始下一个模型训练...")
-                time.sleep(10)
+                print(f"⏸️  等待 5 秒后开始下一个模型训练...")
+                time.sleep(5)
         
         # 训练总结
         print(f"\n{'='*60}")
@@ -400,7 +455,15 @@ class ModelTrainer:
             print(f"  {i:2d}. {config['name']}")
             print(f"      模型类型: {config['model_type'].upper()}")
             print(f"      物理限制: {config['physics_type']}")
-            print(f"      Lambda值: {config['lambda_physics']}")
+            
+            # 显示lambda信息
+            if config.get("use_curriculum", False):
+                print(f"      课程学习: 启用 (max_λ={config.get('max_lambda', config['lambda_physics'])})")
+                print(f"      热身期: {config.get('warmup_epochs', 5)} 轮")
+                print(f"      增长期: {config.get('ramp_epochs', 10)} 轮")
+            else:
+                print(f"      Lambda值: {config['lambda_physics']}")
+                
             print(f"      模型目录: {config['model_dir']}")
             print()
 
