@@ -130,7 +130,7 @@ def analyze_traffic_delay_relationship(samples, output_dir="data_validation"):
     print(f"Traffic-Delay correlation coefficient: {correlation:.4f}")
     
     # 创建综合分析图
-    fig, axes = plt.subplots(2, 4, figsize=(24, 12))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     
     # 1. 主散点图：Traffic vs Delay
     ax1 = axes[0, 0]
@@ -231,7 +231,7 @@ def analyze_traffic_delay_relationship(samples, output_dir="data_validation"):
                            textcoords='offset points', fontsize=8, 
                            color='red', alpha=0.7)
     
-    # 6. 对数坐标下的关系
+    # 6. 对数坐标下的关系（移到第三列）
     ax6 = axes[1, 2]
     # 过滤掉非正值
     positive_traffic = all_traffic[all_traffic > 0]
@@ -246,56 +246,10 @@ def analyze_traffic_delay_relationship(samples, output_dir="data_validation"):
         ax6.set_title('Log-Log Traffic vs Delay')
         ax6.grid(True, alpha=0.3)
     
-    # 7. 样本数据统计表
-    ax7 = axes[1, 3]
-    ax7.axis('off')
-    
-    # 计算高百分位统计信息
+    # 计算高百分位统计信息（用于报告文件）
     delay_p90 = np.percentile(all_delay, 90)
     delay_p95 = np.percentile(all_delay, 95)
     delay_p99 = np.percentile(all_delay, 99)
-    
-    stats_text = f"""
-    Data Statistics:
-    
-    Total Samples: {len(samples)}
-    Total Data Points: {len(all_traffic)}
-    
-    Traffic Statistics:
-      Mean: {np.mean(all_traffic):.3f} Mbps
-      Std: {np.std(all_traffic):.3f} Mbps
-      Min: {np.min(all_traffic):.3f} Mbps
-      Max: {np.max(all_traffic):.3f} Mbps
-    
-    Delay Statistics:
-      Mean: {np.mean(all_delay):.6f} sec
-      Std: {np.std(all_delay):.6f} sec
-      Min: {np.min(all_delay):.6f} sec
-      Max: {np.max(all_delay):.6f} sec
-      50th percentile: {np.percentile(all_delay, 50):.6f} sec
-      90th percentile: {delay_p90:.6f} sec
-      95th percentile: {delay_p95:.6f} sec
-      99th percentile: {delay_p99:.6f} sec
-    
-    Correlation Analysis:
-      Pearson Correlation: {correlation:.4f}
-      
-    Physical Expectation:
-      Expected: Positive correlation
-      Actual: {'✓ Positive' if correlation > 0.1 else '✗ Negative' if correlation < -0.1 else '~ Neutral'}
-    
-    Trend Analysis:
-      Slope: {z[0]:.6f}
-      Interpretation: {'✓ Delay increases with traffic' if z[0] > 0 else '✗ Delay decreases with traffic' if z[0] < 0 else '~ No clear trend'}
-      
-    High Percentile Analysis:
-      Traffic bins analyzed: {len(bin_centers) if 'bin_centers' in locals() else 'N/A'}
-      P95/P50 ratio: {delay_p95/np.percentile(all_delay, 50):.2f}
-    """
-    
-    ax7.text(0.05, 0.95, stats_text, transform=ax7.transAxes, fontsize=10,
-             verticalalignment='top', fontfamily='monospace',
-             bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'traffic_delay_analysis.png'), dpi=300, bbox_inches='tight')

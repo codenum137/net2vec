@@ -17,7 +17,8 @@ import sys
 sys.path.append(os.path.dirname(__file__))
 from routenet_tf2 import (
     RouteNet, create_dataset, parse_fn, transformation_func,
-    scale_fn, heteroscedastic_loss, binomial_loss, create_model_and_loss_fn
+    scale_fn, heteroscedastic_loss, binomial_loss, create_model_and_loss_fn,
+    PhysicsInformedRouteNet
 )
 
 def calculate_r2(y_pred, y_true):
@@ -100,9 +101,6 @@ def load_model(model_dir, target, config, use_kan=False):
     """
     加载指定目标的模型
     """
-    # 根据target和use_kan参数创建相应的模型
-    model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
-    
     # 寻找权重文件
     if use_kan:
         weight_files = [
@@ -125,6 +123,23 @@ def load_model(model_dir, target, config, use_kan=False):
     
     if weight_path is None:
         raise FileNotFoundError("No model weights found in {}".format(model_dir))
+    
+    # 尝试使用新的PhysicsInformedRouteNet加载，如果失败则使用旧的方式
+    try:
+        # 先尝试新的模型结构 (PhysicsInformedRouteNet)
+        model = PhysicsInformedRouteNet(
+            target=target,
+            use_kan=use_kan,
+            use_physics_loss=False,  # 评估时不需要物理约束
+            use_hard_constraint=False,
+            lambda_physics=0.0,
+            use_curriculum=False
+        )
+        print(f"Using PhysicsInformedRouteNet for {target} evaluation")
+    except Exception as e:
+        print(f"Failed to create PhysicsInformedRouteNet: {e}, falling back to original model")
+        # 回退到旧的模型创建方式
+        model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
     
     model_type = "KAN" if use_kan else "MLP"
     print("Loading {} {} model weights from: {}".format(model_type, target, weight_path))

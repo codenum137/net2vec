@@ -374,9 +374,11 @@ class PhysicsInformedRouteNet(tf.keras.Model):
             self.ramp_epochs = ramp_epochs
             self.max_lambda = max_lambda
             self.lambda_physics = tf.Variable(0.0, trainable=False, name='lambda_physics')
+            self.current_lambda_physics = tf.Variable(0.0, trainable=False, name='current_lambda_physics')
             self.current_epoch = tf.Variable(0, trainable=False, name='current_epoch', dtype=tf.int32)
         else:
             self.lambda_physics = lambda_physics
+            self.current_lambda_physics = lambda_physics
         
         # 创建核心RouteNet模型
         if target == 'delay':
@@ -468,7 +470,9 @@ class PhysicsInformedRouteNet(tf.keras.Model):
             (hold_condition, lambda: self.max_lambda)
         ], exclusive=True)
         
+        # 更新两个lambda变量：lambda_physics用于记录，current_lambda_physics用于实际计算
         self.lambda_physics.assign(new_lambda)
+        self.current_lambda_physics.assign(new_lambda)
         self.current_epoch.assign(tf.cast(epoch, tf.int32))
         
         return new_lambda
@@ -574,7 +578,7 @@ class PhysicsInformedRouteNet(tf.keras.Model):
         features, y_true = data
         
         # 获取当前lambda值（课程学习或固定值）
-        current_lambda = self.lambda_physics if self.use_curriculum else self.lambda_physics
+        current_lambda = self.current_lambda_physics if self.use_curriculum else self.lambda_physics
         
         with tf.GradientTape() as tape:
             # 关键：单次前向传播同时获得预测和梯度
@@ -1024,6 +1028,16 @@ def main(args):
     best_eval_loss = float('inf')
     global_step = 0
     
+    # 早停变量初始化
+    if args.early_stopping:
+        early_stopping_patience = args.early_stopping_patience
+        early_stopping_counter = 0
+        early_stopping_min_delta = args.early_stopping_min_delta
+        best_weights = None
+        print(f"🛑 Early stopping enabled: patience={early_stopping_patience}, min_delta={early_stopping_min_delta}")
+    else:
+        early_stopping_min_delta = 0.0  # 为非早停模式设置默认值
+    
     for epoch in range(args.epochs):
         print("\nEpoch {}/{}".format(epoch + 1, args.epochs))
         
@@ -1180,7 +1194,7 @@ def main(args):
                 optimizer.learning_rate.numpy() if hasattr(optimizer.learning_rate, 'numpy') else optimizer.learning_rate))
 
         # 保存最佳模型
-        if avg_eval_loss < best_eval_loss:
+        if avg_eval_loss < best_eval_loss - early_stopping_min_delta if args.early_stopping else avg_eval_loss < best_eval_loss:
             print("Evaluation loss improved from {:.4f} to {:.4f}. Saving model...".format(
                 best_eval_loss, avg_eval_loss))
             best_eval_loss = avg_eval_loss
@@ -1190,16 +1204,53 @@ def main(args):
             save_path = os.path.join(args.model_dir, "best_{}_{}.weights.h5".format(args.target, model_suffix))
             model.save_weights(save_path)
             
+            # 早停：重置计数器并保存最佳权重
+            if args.early_stopping:
+                early_stopping_counter = 0
+                if args.early_stopping_restore_best:
+                    best_weights = model.get_weights()
+                    print("🔄 Early stopping: best weights saved")
+            
             # 记录最佳模型的信息
             with val_summary_writer.as_default():
                 tf.summary.scalar('best_loss', best_eval_loss, step=epoch + 1)
         else:
             print("Evaluation loss did not improve from {:.4f}.".format(best_eval_loss))
+            
+            # 早停：增加计数器
+            if args.early_stopping:
+                early_stopping_counter += 1
+                print(f"🛑 Early stopping: {early_stopping_counter}/{early_stopping_patience}")
+                
+                # 检查是否需要早停
+                if early_stopping_counter >= early_stopping_patience:
+                    print(f"🛑 Early stopping triggered after {epoch + 1} epochs!")
+                    print(f"🛑 No improvement for {early_stopping_patience} consecutive epochs")
+                    
+                    # 恢复最佳权重
+                    if args.early_stopping_restore_best and best_weights is not None:
+                        model.set_weights(best_weights)
+                        print("🔄 Restored best model weights")
+                    
+                    break
     
     # 训练结束后，关闭 summary writers
     train_summary_writer.close()
     val_summary_writer.close()
-    print("\nTraining completed! TensorBoard logs saved to: {}".format(log_dir))
+    
+    # 训练完成统计
+    if args.early_stopping:
+        if early_stopping_counter >= early_stopping_patience:
+            print(f"\n🛑 Training stopped early after {epoch + 1}/{args.epochs} epochs")
+            print(f"🛑 Best validation loss: {best_eval_loss:.6f}")
+        else:
+            print(f"\n✅ Training completed normally after {args.epochs} epochs")
+            print(f"✅ Best validation loss: {best_eval_loss:.6f}")
+    else:
+        print(f"\n✅ Training completed after {args.epochs} epochs")
+        print(f"✅ Best validation loss: {best_eval_loss:.6f}")
+    
+    print("TensorBoard logs saved to: {}".format(log_dir))
     print("To view the results, run: tensorboard --logdir {}".format(log_dir))
     
     # 根据是否使用KAN来显示模型文件名
@@ -1239,6 +1290,16 @@ if __name__ == '__main__':
                       help='Factor to reduce learning rate on plateau (only for plateau schedule)')
     parser.add_argument('--plateau_patience', type=int, default=3,
                       help='Number of epochs to wait before reducing LR on plateau (only for plateau schedule)')
+    
+    # 早停参数
+    parser.add_argument('--early_stopping', action='store_true',
+                      help='Enable early stopping based on validation loss')
+    parser.add_argument('--early_stopping_patience', type=int, default=5,
+                      help='Number of epochs to wait before early stopping (default: 5)')
+    parser.add_argument('--early_stopping_min_delta', type=float, default=1e-6,
+                      help='Minimum change in monitored quantity to qualify as an improvement (default: 1e-6)')
+    parser.add_argument('--early_stopping_restore_best', action='store_true',
+                      help='Restore model weights from the epoch with the best value of the monitored quantity')
     
     # 物理约束损失参数
     parser.add_argument('--physics_loss', action='store_true',

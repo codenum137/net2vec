@@ -14,13 +14,15 @@ from pathlib import Path
 import argparse
 
 class ModelTrainer:
-    def __init__(self, base_dir="/home/ubantu/net2vec", force_retrain=False):
+    def __init__(self, base_dir="/home/ubantu/net2vec", force_retrain=False, enable_early_stopping=True, early_stopping_patience=5):
         self.base_dir = Path(base_dir)
         self.train_script = self.base_dir / "routenet" / "routenet_tf2.py"
         self.train_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "train"
         self.eval_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "evaluate"
-        self.models_base_dir = self.base_dir / "fixed_model/"
+        self.models_base_dir = self.base_dir / "fixed_model/0917-opt"
         self.force_retrain = force_retrain  # 是否强制重新训练已存在的模型
+        self.enable_early_stopping = enable_early_stopping  # 是否启用早停机制
+        self.early_stopping_patience = early_stopping_patience  # 早停耐心值
         
         # 训练配置
         self.training_configs = self._generate_training_configs()
@@ -31,14 +33,14 @@ class ModelTrainer:
         
         # 模型类型和物理限制组合
         model_configs = [
-            # 不使用物理约束的配置
-            {"type": "mlp", "use_kan": False, "physics": "none", "use_physics_loss": False, "use_hard_constraint": False},
-            {"type": "kan", "use_kan": True, "physics": "none", "use_physics_loss": False, "use_hard_constraint": False},
-            # 使用物理约束的配置 - 传统固定lambda
-            {"type": "mlp", "use_kan": False, "physics": "soft", "use_physics_loss": True, "use_hard_constraint": False},
-            {"type": "mlp", "use_kan": False, "physics": "hard", "use_physics_loss": True, "use_hard_constraint": True},
-            {"type": "kan", "use_kan": True, "physics": "soft", "use_physics_loss": True, "use_hard_constraint": False},
-            {"type": "kan", "use_kan": True, "physics": "hard", "use_physics_loss": True, "use_hard_constraint": True},
+            # # 不使用物理约束的配置
+            # {"type": "mlp", "use_kan": False, "physics": "none", "use_physics_loss": False, "use_hard_constraint": False},
+            # {"type": "kan", "use_kan": True, "physics": "none", "use_physics_loss": False, "use_hard_constraint": False},
+            # # 使用物理约束的配置 - 传统固定lambda
+            # {"type": "mlp", "use_kan": False, "physics": "soft", "use_physics_loss": True, "use_hard_constraint": False},
+            # {"type": "mlp", "use_kan": False, "physics": "hard", "use_physics_loss": True, "use_hard_constraint": True},
+            # {"type": "kan", "use_kan": True, "physics": "soft", "use_physics_loss": True, "use_hard_constraint": False},
+            # {"type": "kan", "use_kan": True, "physics": "hard", "use_physics_loss": True, "use_hard_constraint": True},
             # 使用物理约束的配置 - 课程学习
             {"type": "mlp", "use_kan": False, "physics": "soft_cl", "use_physics_loss": True, "use_hard_constraint": False, "use_curriculum": True},
             {"type": "mlp", "use_kan": False, "physics": "hard_cl", "use_physics_loss": True, "use_hard_constraint": True, "use_curriculum": True},
@@ -47,7 +49,7 @@ class ModelTrainer:
         ]
         
         # lambda_physics参数
-        lambda_values = [0.1, 0.5, 1.0]
+        lambda_values = [0.1]
         
         for model_config in model_configs:
             if model_config["use_physics_loss"]:
@@ -126,6 +128,7 @@ class ModelTrainer:
             "--learning_rate", "0.001",
             "--plateau_patience", "8",  # 增加耐心值
             "--plateau_factor", "0.5",
+
         ]
         
         # 添加物理损失相关参数（仅在使用物理约束时）
@@ -151,6 +154,15 @@ class ModelTrainer:
         # 添加KAN相关参数
         if config["use_kan"]:
             cmd.append("--kan")  # 修正参数名：使用 --kan 而不是 --use_kan
+        
+        # 添加早停机制参数
+        if self.enable_early_stopping:
+            cmd.extend([
+                "--early_stopping",
+                "--early_stopping_patience", str(8 if config.get("use_curriculum", False) else self.early_stopping_patience),
+                "--early_stopping_min_delta", "1e-6",
+                "--early_stopping_restore_best"
+            ])
             
         return cmd
     
@@ -474,10 +486,19 @@ def main():
     parser.add_argument("--models", nargs="+", help="仅训练指定的模型")
     parser.add_argument("--base-dir", default="/home/ubantu/net2vec", help="项目根目录")
     parser.add_argument("--force", action="store_true", help="强制重新训练已存在的模型")
+    # 早停相关参数
+    parser.add_argument("--no-early-stopping", action="store_true", help="禁用早停机制")
+    parser.add_argument("--early-stopping-patience", type=int, default=5, help="早停耐心值 (默认: 5)")
     
     args = parser.parse_args()
     
-    trainer = ModelTrainer(base_dir=args.base_dir, force_retrain=args.force)
+    # 创建trainer，传入早停相关参数
+    trainer = ModelTrainer(
+        base_dir=args.base_dir, 
+        force_retrain=args.force,
+        enable_early_stopping=not args.no_early_stopping,
+        early_stopping_patience=args.early_stopping_patience
+    )
     
     if args.list:
         trainer.list_configs()
@@ -488,6 +509,12 @@ def main():
         print("🔄 强制重新训练模式：将覆盖已存在的模型")
     else:
         print("⏭️  跳过模式：已存在的模型将被跳过")
+    
+    # 显示早停设置
+    if trainer.enable_early_stopping:
+        print(f"🛑 早停机制：启用 (耐心值: {trainer.early_stopping_patience})")
+    else:
+        print("🛑 早停机制：禁用")
     
     # 确认开始训练
     if not args.models and not args.start_from:
