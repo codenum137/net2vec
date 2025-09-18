@@ -11,4 +11,4 @@ source ~/.bashrc
 nvidia-smi
 conda activate tf_env
 cd ~/net2vec
-python  train_models.py
+python  train_models.py -y

@@ -14,7 +14,7 @@ from pathlib import Path
 import argparse
 
 class ModelTrainer:
-    def __init__(self, base_dir="/home/ubantu/net2vec", force_retrain=False, enable_early_stopping=True, early_stopping_patience=5):
+    def __init__(self, base_dir="./", force_retrain=False, enable_early_stopping=True, early_stopping_patience=5):
         self.base_dir = Path(base_dir)
         self.train_script = self.base_dir / "routenet" / "routenet_tf2.py"
         self.train_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "train"
@@ -484,7 +484,7 @@ def main():
     parser.add_argument("--list", action="store_true", help="列出所有训练配置")
     parser.add_argument("--start-from", type=str, help="从指定模型开始训练")
     parser.add_argument("--models", nargs="+", help="仅训练指定的模型")
-    parser.add_argument("--base-dir", default="/home/ubantu/net2vec", help="项目根目录")
+    parser.add_argument("--base-dir", default="./", help="项目根目录")
     parser.add_argument("--force", action="store_true", help="强制重新训练已存在的模型")
     parser.add_argument("--yes", "-y", action="store_true", help="自动确认训练，无需手动输入")
     # 早停相关参数
