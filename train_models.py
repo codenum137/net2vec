@@ -486,6 +486,7 @@ def main():
     parser.add_argument("--models", nargs="+", help="仅训练指定的模型")
     parser.add_argument("--base-dir", default="/home/ubantu/net2vec", help="项目根目录")
     parser.add_argument("--force", action="store_true", help="强制重新训练已存在的模型")
+    parser.add_argument("--yes", "-y", action="store_true", help="自动确认训练，无需手动输入")
     # 早停相关参数
     parser.add_argument("--no-early-stopping", action="store_true", help="禁用早停机制")
     parser.add_argument("--early-stopping-patience", type=int, default=5, help="早停耐心值 (默认: 5)")
@@ -517,11 +518,13 @@ def main():
         print("🛑 早停机制：禁用")
     
     # 确认开始训练
-    if not args.models and not args.start_from:
+    if not args.models and not args.start_from and not args.yes:
         response = input(f"\n确认开始训练所有 {len(trainer.training_configs)} 个模型? (y/N): ")
         if response.lower() != 'y':
             print("❌ 取消训练")
             return
+    elif args.yes:
+        print(f"✅ 自动确认训练所有 {len(trainer.training_configs)} 个模型")
     
     trainer.train_all_models(start_from=args.start_from, models_to_train=args.models)
 

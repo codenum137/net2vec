@@ -19,7 +19,7 @@ from scipy import stats
 import sys
 sys.path.append(os.path.dirname(__file__))
 from routenet_tf2 import (
-    RouteNet, create_dataset, KANLayer, create_model_and_loss_fn
+    RouteNet, create_dataset, KANLayer, create_model_and_loss_fn, PhysicsInformedRouteNet
 )
 
 class KANVisualizer:
@@ -34,8 +34,22 @@ class KANVisualizer:
         self.kan_layers = []
         
     def load_model(self):
-        """加载KAN模型"""
-        self.model, _ = create_model_and_loss_fn(self.config, self.target, use_kan=self.use_kan)
+        """加载KAN模型 - 兼容新的 PhysicsInformedRouteNet 结构"""
+        # 尝试使用新的 PhysicsInformedRouteNet，如果失败则使用旧方式
+        try:
+            self.model = PhysicsInformedRouteNet(
+                config=self.config,
+                target=self.target,
+                use_kan=self.use_kan,
+                use_physics_loss=False,  # 可视化时不需要物理约束
+                use_hard_constraint=False,
+                lambda_physics=0.0,
+                use_curriculum=False
+            )
+            print(f"Using PhysicsInformedRouteNet for {self.target} visualization")
+        except Exception as e:
+            print(f"Failed to create PhysicsInformedRouteNet: {e}, falling back to original model")
+            self.model, _ = create_model_and_loss_fn(self.config, self.target, use_kan=self.use_kan)
         
         # 寻找权重文件
         if self.use_kan:
@@ -72,7 +86,14 @@ class KANVisualizer:
         }
         
         _ = self.model(dummy_input, training=False)
-        self.model.load_weights(weight_path)
+        try:
+            self.model.load_weights(weight_path)
+        except Exception as e:
+            print(f"Error loading weights: {e}")
+            # 尝试重新构建模型
+            self.model.build(input_shape=(None, None))
+            self.model.load_weights(weight_path)
+            print("Model loaded successfully after rebuilding!")
         
         # 提取KAN层
         if self.use_kan:
