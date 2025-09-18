@@ -9,7 +9,7 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 import seaborn as sns
-from routenet_tf2 import RouteNet, create_model_and_loss_fn
+from routenet_tf2 import RouteNet, create_model_and_loss_fn, PhysicsInformedRouteNet
 import argparse
 from tqdm import tqdm
 
@@ -30,10 +30,24 @@ class JacobianAnalyzer:
         self.target = target
         self.use_kan = use_kan
         
-        # 创建模型
-        self.model, self.loss_fn = create_model_and_loss_fn(
-            config, target, use_kan=use_kan
-        )
+        # 创建模型 - 尝试新的 PhysicsInformedRouteNet，如果失败则使用旧方式
+        try:
+            self.model = PhysicsInformedRouteNet(
+                config=config,
+                target=target,
+                use_kan=use_kan,
+                use_physics_loss=False,  # 分析时不需要物理约束
+                use_hard_constraint=False,
+                lambda_physics=0.0,
+                use_curriculum=False
+            )
+            self.loss_fn = None  # 分析时不需要损失函数
+            print(f"Using PhysicsInformedRouteNet for {target} jacobian analysis")
+        except Exception as e:
+            print(f"Failed to create PhysicsInformedRouteNet: {e}, falling back to original model")
+            self.model, self.loss_fn = create_model_and_loss_fn(
+                config, target, use_kan=use_kan
+            )
         
         # 加载权重
         self._load_model(model_path)
@@ -60,8 +74,15 @@ class JacobianAnalyzer:
                 print("模型构建完成")
                 
                 # 加载权重
-                self.model.load_weights(model_path)
-                print(f"成功加载模型权重: {model_path}")
+                try:
+                    self.model.load_weights(model_path)
+                    print(f"成功加载模型权重: {model_path}")
+                except Exception as weight_error:
+                    print(f"权重加载失败: {weight_error}")
+                    # 尝试重新构建模型
+                    self.model.build(input_shape=(None, None))
+                    self.model.load_weights(model_path)
+                    print(f"重新构建后成功加载模型权重: {model_path}")
             else:
                 raise FileNotFoundError(f"模型文件不存在: {model_path}")
         except Exception as e:

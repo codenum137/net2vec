@@ -67,6 +67,7 @@ def load_model(model_dir, target, config, use_kan=False):
     try:
         # 先尝试新的模型结构 (PhysicsInformedRouteNet)
         model = PhysicsInformedRouteNet(
+            config=config,
             target=target,
             use_kan=use_kan,
             use_physics_loss=False,  # 评估时不需要物理约束
@@ -75,9 +76,17 @@ def load_model(model_dir, target, config, use_kan=False):
             use_curriculum=False
         )
         print(f"Using PhysicsInformedRouteNet for {target} evaluation")
+        return model, weight_path
+        
     except Exception as e:
         print(f"Failed to create PhysicsInformedRouteNet: {e}, falling back to original model")
         # 回退到旧的模型创建方式
+        from routenet_tf2 import create_model_and_loss_fn
+        
+        # 使用旧的模型创建方式
+        model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
+        print(f"Using legacy model for {target} evaluation")
+        return model, weight_path
         model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
     
     model_type = "KAN" if use_kan else "MLP"
@@ -106,7 +115,11 @@ def evaluate_delay_jitter_model(model, dataset, num_samples=None):
     
     for features, labels in tqdm(dataset, desc="Evaluating delay/jitter model"):
         # 模型预测 - 异方差输出：[loc, scale]
-        pred = model(features, training=False)
+        # 根据模型类型选择正确的调用方式
+        if isinstance(model, PhysicsInformedRouteNet):
+            pred = model.routenet(features, training=False)
+        else:
+            pred = model(features, training=False)
         
         pred_delay = pred[:, 0].numpy()  # 延迟预测均值 (loc)
         
@@ -168,7 +181,11 @@ def evaluate_drops_model(model, dataset, num_samples=None):
     
     for features, labels in tqdm(dataset, desc="Evaluating drops model"):
         # 模型预测 - 输出 logits
-        pred_logits = model(features, training=False)
+        # 根据模型类型选择正确的调用方式
+        if isinstance(model, PhysicsInformedRouteNet):
+            pred_logits = model.routenet(features, training=False)
+        else:
+            pred_logits = model(features, training=False)
         pred_probs = tf.nn.sigmoid(pred_logits[:, 0]).numpy()
         
         # 收集真实值
@@ -370,14 +387,42 @@ def main():
     
     # 初始化模型权重（需要先运行一次前向传播）
     print("\nInitializing models...")
-    for dataset in [nsfnet_dataset.take(1)]:
-        for features, labels in dataset:
-            _ = delay_model(features, training=False)
-            break
+    
+    # 检查模型类型并相应处理
+    if isinstance(delay_model, PhysicsInformedRouteNet):
+        # 对于PhysicsInformedRouteNet，需要先进行完整的前向传播来构建模型
+        for dataset in [nsfnet_dataset.take(1)]:
+            for features, labels in dataset:
+                # 使用完整的调用路径来确保模型被正确构建
+                _ = delay_model(features, training=False)
+                break
+    else:
+        # 对于传统模型
+        for dataset in [nsfnet_dataset.take(1)]:
+            for features, labels in dataset:
+                _ = delay_model(features, training=False)
+                break
     
     # 加载权重
-    delay_model.load_weights(delay_weight_path)
-    print("Models loaded successfully!")
+    try:
+        delay_model.load_weights(delay_weight_path)
+        print("Models loaded successfully!")
+    except Exception as e:
+        print(f"Failed to load weights: {e}")
+        # 尝试加载到子模型
+        if isinstance(delay_model, PhysicsInformedRouteNet):
+            try:
+                delay_model.routenet.load_weights(delay_weight_path)
+                print("Weights loaded to routenet submodel successfully!")
+            except Exception as e2:
+                print(f"Failed to load weights to routenet submodel: {e2}")
+                # 最后尝试：手动构建模型结构
+                print("Attempting manual model building...")
+                delay_model.routenet.build(input_shape=[(None, None, None), (None, None)])
+                delay_model.routenet.load_weights(delay_weight_path)
+                print("Weights loaded after manual building!")
+        else:
+            raise e
     
     # 评估NSFNet（同拓扑）
     print("\n" + "="*50)

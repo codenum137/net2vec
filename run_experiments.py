@@ -33,9 +33,73 @@ class ExperimentRunner:
         with open(self.config_file, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
         
+        # 如果配置文件包含 model_configs，自动生成 models
+        if 'model_configs' in config:
+            config = self._generate_models_from_configs(config)
+        
         print(f"✅ 已加载配置文件: {self.config_file}")
         print(f"📋 发现 {len(config['models'])} 个模型配置")
         print(f"🧪 发现 {len(config['experiments'])} 种实验类型")
+        
+        return config
+    
+    def _generate_models_from_configs(self, config):
+        """基于 model_configs 自动生成 models 配置"""
+        print("🔧 检测到 model_configs，自动生成模型配置...")
+        
+        model_configs = config.get('model_configs', [])
+        lambda_values = config.get('lambda_values', [0.1])
+        
+        generated_models = {}
+        
+        for model_config in model_configs:
+            if not model_config.get('enabled', True):
+                print(f"⏭️  跳过禁用的配置: {model_config['type']}_{model_config['physics']}")
+                continue
+                
+            for lambda_val in lambda_values:
+                # 生成模型名称
+                if model_config['physics'] == 'none':
+                    model_name = f"{model_config['type']}_{model_config['physics']}"
+                else:
+                    model_name = f"{model_config['type']}_{model_config['physics']}_{lambda_val}"
+                
+                # 生成模型配置
+                model_def = {
+                    'model_type': model_config['type'],
+                    'physics_type': model_config['physics'],
+                    'lambda_physics': 0.0 if model_config['physics'] == 'none' else lambda_val,
+                    'delay_model_dir': model_name,
+                    'use_kan': model_config['type'] == 'kan'  # 自动推断use_kan
+                }
+                
+                # 添加物理约束相关配置
+                if model_config['physics'] != 'none':
+                    model_def.update({
+                        'use_physics_loss': True,
+                        'use_hard_constraint': 'hard' in model_config['physics']
+                    })
+                else:
+                    model_def.update({
+                        'use_physics_loss': False,
+                        'use_hard_constraint': False
+                    })
+                
+                # 添加课程学习相关配置
+                if '_cl' in model_config['physics']:
+                    model_def.update({
+                        'use_curriculum': True,
+                        'curriculum_learning': True,
+                        'warmup_steps': 5,
+                        'ramp_up_steps': 10
+                    })
+                
+                generated_models[model_name] = model_def
+                print(f"✅ 生成模型配置: {model_name}")
+        
+        # 更新配置
+        config['models'] = generated_models
+        print(f"🎯 总共生成 {len(generated_models)} 个模型配置")
         
         return config
     

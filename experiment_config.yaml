@@ -8,7 +8,7 @@ global_settings:
   gbn_test_dir: "data/routenet/gbnbw/tfrecords/evaluate"
   
   # 模型目录基础路径
-  models_base_dir: "fixed_model/"
+  models_base_dir: "fixed_model/0917-opt"
   
   # 实验参数
   batch_size: 32
@@ -20,148 +20,72 @@ global_settings:
   num_points: 20
   
   # 输出根目录
-  base_output_dir: "experiment_results/test"
+  base_output_dir: "experiment_results/0917-opt"
 
-# 模型配置
+# 模型配置方案（类似train_models.py的结构）
+# 只需要设置 enabled: true 的配置会被实际使用
+model_configs:
+  # 不使用物理约束的配置
+  - type: "mlp"
+    physics: "none"
+    enabled: true  # 当前不启用基线模型
+    
+  - type: "kan"  
+    physics: "none"
+    enabled: true  # 当前不启用基线模型
+    
+  # 使用物理约束的配置 - 传统固定lambda
+  - type: "mlp"
+    physics: "soft"
+    enabled: true  # 当前不启用传统软约束
+    
+  - type: "mlp"
+    physics: "hard" 
+    enabled: true  # 当前不启用传统硬约束
+    
+  - type: "kan"
+    physics: "soft"
+    enabled: true  # 当前不启用传统软约束
+    
+  - type: "kan"
+    physics: "hard"
+    enabled: true  # 当前不启用传统硬约束
+    
+  # 使用物理约束的配置 - 课程学习（当前启用的配置）
+  - type: "mlp"
+    physics: "soft_cl"
+    enabled: true  # 当前不启用MLP软约束课程学习
+    
+  - type: "mlp"
+    physics: "hard_cl"
+    enabled: true   # ✅ 启用MLP硬约束课程学习
+    
+  - type: "kan"
+    physics: "soft_cl"
+    enabled: true   # ✅ 启用KAN软约束课程学习
+    
+  - type: "kan"
+    physics: "hard_cl"
+    enabled: false  # 当前不启用KAN硬约束课程学习（模型不存在）
+
+# lambda_physics参数值（会与上述配置组合生成最终模型）
+lambda_values: [0.1]
+
+# 自动生成规则说明：
+# - enabled: true 的配置会与 lambda_values 中的每个值组合
+# - 生成的模型名称格式：{type}_{physics}_{lambda} （none类型除外）
+# - physics包含"_cl"的配置会自动添加课程学习参数
+# - use_kan会根据type自动设置（kan=true, mlp=false）
+
+# 自动生成的模型配置（基于上述配置和lambda值）
 models:
-  # 无物理约束基线模型
-  mlp_none:
-    model_type: "mlp"
-    physics_type: "none"
-    lambda_physics: 0.0
-    delay_model_dir: "mlp_none"
-    use_kan: false
-
-  kan_none:
-    model_type: "kan"
-    physics_type: "none"
-    lambda_physics: 0.0
-    delay_model_dir: "kan_none"
-    use_kan: true
-
-  # MLP模型 - 软约束
-  mlp_soft_0.1:
-    model_type: "mlp"
-    physics_type: "soft"
-    lambda_physics: 0.1
-    delay_model_dir: "mlp_soft_0.1"
-    use_kan: false
-    
-  mlp_soft_0.5:
-    model_type: "mlp"
-    physics_type: "soft"
-    lambda_physics: 0.5
-    delay_model_dir: "mlp_soft_0.5"
-    use_kan: false
-    
-  mlp_soft_1.0:
-    model_type: "mlp"
-    physics_type: "soft"
-    lambda_physics: 1.0
-    delay_model_dir: "mlp_soft_1.0"
-    use_kan: false
-    
-  # MLP模型 - 硬约束
-  mlp_hard_0.1:
-    model_type: "mlp"
-    physics_type: "hard"
-    lambda_physics: 0.1
-    delay_model_dir: "mlp_hard_0.1"
-    use_kan: false
-    
-  mlp_hard_0.5:
-    model_type: "mlp"
-    physics_type: "hard"
-    lambda_physics: 0.5
-    delay_model_dir: "mlp_hard_0.5"
-    use_kan: false
-    
-  mlp_hard_1.0:
-    model_type: "mlp"
-    physics_type: "hard"
-    lambda_physics: 1.0
-    delay_model_dir: "mlp_hard_1.0"
-    use_kan: false
-
-  # KAN模型 - 软约束
-  kan_soft_0.1:
-    model_type: "kan"
-    physics_type: "soft"
-    lambda_physics: 0.1
-    delay_model_dir: "kan_soft_0.1"
-    use_kan: true
-    
-  kan_soft_0.5:
-    model_type: "kan"
-    physics_type: "soft"
-    lambda_physics: 0.5
-    delay_model_dir: "kan_soft_0.5"
-    use_kan: true
-    
-  kan_soft_1.0:
-    model_type: "kan"
-    physics_type: "soft"
-    lambda_physics: 1.0
-    delay_model_dir: "kan_soft_1.0"
-    use_kan: true
-    
-  # KAN模型 - 硬约束
-  kan_hard_0.1:
-    model_type: "kan"
-    physics_type: "hard"
-    lambda_physics: 0.1
-    delay_model_dir: "kan_hard_0.1"
-    use_kan: true
-    
-  kan_hard_0.5:
-    model_type: "kan"
-    physics_type: "hard"
-    lambda_physics: 0.5
-    delay_model_dir: "kan_hard_0.5"
-    use_kan: true
-    
-  kan_hard_1.0:
-    model_type: "kan"
-    physics_type: "hard"
-    lambda_physics: 1.0
-    delay_model_dir: "kan_hard_1.0"
-    use_kan: true
-    
-  # 课程学习模型配置 - MLP软约束
-  mlp_soft_cl_0.1:
-    model_type: "mlp"
-    physics_type: "soft"
-    lambda_physics: 0.1
-    delay_model_dir: "mlp_soft_cl_0.1"
-    use_kan: false
-    curriculum_learning: true
-    warmup_steps: 5
-    ramp_up_steps: 10
-    
-  mlp_soft_cl_0.5:
-    model_type: "mlp"
-    physics_type: "soft"
-    lambda_physics: 0.5
-    delay_model_dir: "mlp_soft_cl_0.5"
-    use_kan: false
-    curriculum_learning: true
-    warmup_steps: 5
-    ramp_up_steps: 10
-    
-  mlp_soft_cl_1.0:
-    model_type: "mlp"
-    physics_type: "soft"
-    lambda_physics: 1.0
-    delay_model_dir: "mlp_soft_cl_1.0"
-    use_kan: false
-    curriculum_learning: true
-    warmup_steps: 5
-    ramp_up_steps: 10
-    
-  # 课程学习模型配置 - MLP硬约束
+  # 基于上述配置自动生成的模型列表
+  # 只会生成 enabled: true 的配置
+  
+  # 当前启用的模型（对应train_models.py中的活跃配置）
   mlp_hard_cl_0.1:
     model_type: "mlp"
-    physics_type: "hard"
+    physics_type: "hard_cl"
     lambda_physics: 0.1
     delay_model_dir: "mlp_hard_cl_0.1"
     use_kan: false
@@ -169,30 +93,9 @@ models:
     warmup_steps: 5
     ramp_up_steps: 10
     
-  mlp_hard_cl_0.5:
-    model_type: "mlp"
-    physics_type: "hard"
-    lambda_physics: 0.5
-    delay_model_dir: "mlp_hard_cl_0.5"
-    use_kan: false
-    curriculum_learning: true
-    warmup_steps: 5
-    ramp_up_steps: 10
-    
-  mlp_hard_cl_1.0:
-    model_type: "mlp"
-    physics_type: "hard"
-    lambda_physics: 1.0
-    delay_model_dir: "mlp_hard_cl_1.0"
-    use_kan: false
-    curriculum_learning: true
-    warmup_steps: 5
-    ramp_up_steps: 10
-    
-  # 课程学习模型配置 - KAN软约束
   kan_soft_cl_0.1:
     model_type: "kan"
-    physics_type: "soft"
+    physics_type: "soft_cl"
     lambda_physics: 0.1
     delay_model_dir: "kan_soft_cl_0.1"
     use_kan: true
@@ -200,52 +103,11 @@ models:
     warmup_steps: 5
     ramp_up_steps: 10
     
-  kan_soft_cl_0.5:
-    model_type: "kan"
-    physics_type: "soft"
-    lambda_physics: 0.5
-    delay_model_dir: "kan_soft_cl_0.5"
-    use_kan: true
-    curriculum_learning: true
-    warmup_steps: 5
-    ramp_up_steps: 10
-    
-  kan_soft_cl_1.0:
-    model_type: "kan"
-    physics_type: "soft"
-    lambda_physics: 1.0
-    delay_model_dir: "kan_soft_cl_1.0"
-    use_kan: true
-    curriculum_learning: true
-    warmup_steps: 5
-    ramp_up_steps: 10
-    
-  # 课程学习模型配置 - KAN硬约束
   kan_hard_cl_0.1:
     model_type: "kan"
-    physics_type: "hard"
+    physics_type: "hard_cl"
     lambda_physics: 0.1
     delay_model_dir: "kan_hard_cl_0.1"
-    use_kan: true
-    curriculum_learning: true
-    warmup_steps: 5
-    ramp_up_steps: 10
-    
-  kan_hard_cl_0.5:
-    model_type: "kan"
-    physics_type: "hard"
-    lambda_physics: 0.5
-    delay_model_dir: "kan_hard_cl_0.5"
-    use_kan: true
-    curriculum_learning: true
-    warmup_steps: 5
-    ramp_up_steps: 10
-    
-  kan_hard_cl_1.0:
-    model_type: "kan"
-    physics_type: "hard"
-    lambda_physics: 1.0
-    delay_model_dir: "kan_hard_cl_1.0"
     use_kan: true
     curriculum_learning: true
     warmup_steps: 5

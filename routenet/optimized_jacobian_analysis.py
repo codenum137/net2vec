@@ -27,15 +27,28 @@ class OptimizedJacobianAnalyzer:
         """加载模型"""
         try:
             import os
-            from routenet_tf2 import create_model_and_loss_fn
+            from routenet_tf2 import create_model_and_loss_fn, PhysicsInformedRouteNet
             from jacobian_analysis import create_simple_network_sample
             
-            # 使用与原始分析器相同的方式创建模型
-            self.model, _ = create_model_and_loss_fn(
-                config=self.config,
-                target=self.target,
-                use_kan=self.use_kan
-            )
+            # 尝试使用新的 PhysicsInformedRouteNet，如果失败则使用旧方式
+            try:
+                self.model = PhysicsInformedRouteNet(
+                    config=self.config,
+                    target=self.target,
+                    use_kan=self.use_kan,
+                    use_physics_loss=False,  # 分析时不需要物理约束
+                    use_hard_constraint=False,
+                    lambda_physics=0.0,
+                    use_curriculum=False
+                )
+                print(f"Using PhysicsInformedRouteNet for optimized {self.target} jacobian analysis")
+            except Exception as e:
+                print(f"Failed to create PhysicsInformedRouteNet: {e}, falling back to original model")
+                self.model, _ = create_model_and_loss_fn(
+                    config=self.config,
+                    target=self.target,
+                    use_kan=self.use_kan
+                )
             
             # 检查权重文件是否存在
             if os.path.exists(model_path):
@@ -56,8 +69,15 @@ class OptimizedJacobianAnalyzer:
                 print("模型构建完成")
                 
                 # 加载权重
-                self.model.load_weights(model_path)
-                print(f"成功加载模型权重: {model_path}")
+                try:
+                    self.model.load_weights(model_path)
+                    print(f"成功加载模型权重: {model_path}")
+                except Exception as weight_error:
+                    print(f"权重加载失败: {weight_error}")
+                    # 尝试重新构建模型
+                    self.model.build(input_shape=(None, None))
+                    self.model.load_weights(model_path)
+                    print(f"重新构建后成功加载模型权重: {model_path}")
             else:
                 raise FileNotFoundError(f"模型文件不存在: {model_path}")
                 

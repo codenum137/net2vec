@@ -99,7 +99,7 @@ def calculate_nll(y_pred_mean, y_pred_scale, y_true):
 
 def load_model(model_dir, target, config, use_kan=False):
     """
-    加载指定目标的模型
+    加载指定目标的模型，兼容新的 PhysicsInformedRouteNet 结构
     """
     # 寻找权重文件
     if use_kan:
@@ -128,6 +128,7 @@ def load_model(model_dir, target, config, use_kan=False):
     try:
         # 先尝试新的模型结构 (PhysicsInformedRouteNet)
         model = PhysicsInformedRouteNet(
+            config=config,  # 添加 config 参数
             target=target,
             use_kan=use_kan,
             use_physics_loss=False,  # 评估时不需要物理约束
@@ -433,8 +434,15 @@ def main():
             break
     
     # 加载权重
-    delay_model.load_weights(delay_weight_path)
-    print("Model loaded successfully!")
+    try:
+        delay_model.load_weights(delay_weight_path)
+        print("Model loaded successfully!")
+    except Exception as e:
+        print(f"Error loading weights: {e}")
+        # 尝试重新构建模型
+        delay_model.build(input_shape=(None, None))
+        delay_model.load_weights(delay_weight_path)
+        print("Model loaded successfully after rebuilding!")
     
     # 评估NSFNet（训练拓扑）
     nsfnet_results = evaluate_model_metrics(
