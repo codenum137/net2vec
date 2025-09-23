@@ -75,7 +75,14 @@ def load_model(model_dir, target, config, use_kan=False):
             lambda_physics=0.0,
             use_curriculum=False
         )
-        print(f"Using PhysicsInformedRouteNet for {target} evaluation")
+        if use_kan:
+            kb = config.get('kan_basis', 'poly')
+            if kb == 'bspline':
+                print(f"Using PhysicsInformedRouteNet (KAN bspline) for {target} evaluation")
+            else:
+                print(f"Using PhysicsInformedRouteNet (KAN poly) for {target} evaluation")
+        else:
+            print(f"Using PhysicsInformedRouteNet (MLP) for {target} evaluation")
         return model, weight_path
         
     except Exception as e:
@@ -84,10 +91,9 @@ def load_model(model_dir, target, config, use_kan=False):
         from routenet_tf2 import create_model_and_loss_fn
         
         # 使用旧的模型创建方式
-        model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
-        print(f"Using legacy model for {target} evaluation")
-        return model, weight_path
-        model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
+    model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
+    print(f"Using legacy model for {target} evaluation")
+    return model, weight_path
     
     model_type = "KAN" if use_kan else "MLP"
     print("Loading {} {} model weights from: {}".format(model_type, target, weight_path))
@@ -349,6 +355,13 @@ def main():
                       help='Limit number of samples to evaluate')
     parser.add_argument('--kan', action='store_true',
                       help='Evaluate KAN-based models instead of traditional MLP models')
+    # KAN basis options (optional; only used when --kan is set)
+    parser.add_argument('--kan_basis', type=str, choices=['poly', 'bspline'], default=None,
+                      help='KAN basis type for readout: poly (default) or bspline')
+    parser.add_argument('--kan_grid_size', type=int, default=None,
+                      help='Number of intervals for B-spline grid (only for bspline basis)')
+    parser.add_argument('--kan_spline_order', type=int, default=None,
+                      help='Degree/order of B-spline basis (only for bspline basis)')
     
     args = parser.parse_args()
     
@@ -365,9 +378,33 @@ def main():
         'l2': 0.1,
         'l2_2': 0.01,
     }
+    # If evaluating KAN models, wire optional basis config
+    if args.kan:
+        # try to infer bspline from model dir when not explicitly provided
+        inferred_basis = None
+        if args.kan_basis is None:
+            mdl = args.delay_model_dir.lower()
+            if 'bspline' in mdl or 'b_spline' in mdl or 'b-spline' in mdl:
+                inferred_basis = 'bspline'
+        basis = args.kan_basis or inferred_basis or 'poly'
+        config['kan_basis'] = basis
+        if basis == 'bspline':
+            if args.kan_grid_size is not None:
+                config['kan_grid_size'] = args.kan_grid_size
+            if args.kan_spline_order is not None:
+                config['kan_spline_order'] = args.kan_spline_order
     
     model_type = "KAN" if args.kan else "MLP"
-    print("Starting comprehensive RouteNet evaluation with {} models...".format(model_type))
+    # Build a readable model description
+    if args.kan:
+        kb = config.get('kan_basis', 'poly')
+        if kb == 'bspline':
+            msg_extra = f" (basis=bspline, grid={config.get('kan_grid_size', 5)}, order={config.get('kan_spline_order', 3)})"
+        else:
+            msg_extra = " (basis=poly)"
+    else:
+        msg_extra = ""
+    print("Starting comprehensive RouteNet evaluation with {} models{}...".format(model_type, msg_extra))
     print("Delay model dir: {}".format(args.delay_model_dir))
     print("NSFNet test dir: {}".format(args.nsfnet_test_dir))
     print("GBN test dir: {}".format(args.gbn_test_dir))
