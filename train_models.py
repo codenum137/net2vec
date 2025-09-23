@@ -19,7 +19,7 @@ class ModelTrainer:
         self.train_script = self.base_dir / "routenet" / "routenet_tf2.py"
         self.train_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "train"
         self.eval_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "evaluate"
-        self.models_base_dir = self.base_dir / "fixed_model/0917-opt"
+        self.models_base_dir = self.base_dir / "fixed_model/0922"
         self.force_retrain = force_retrain  # 是否强制重新训练已存在的模型
         self.enable_early_stopping = enable_early_stopping  # 是否启用早停机制
         self.early_stopping_patience = early_stopping_patience  # 早停耐心值
@@ -40,12 +40,12 @@ class ModelTrainer:
             # {"type": "mlp", "use_kan": False, "physics": "soft", "use_physics_loss": True, "use_hard_constraint": False},
             # {"type": "mlp", "use_kan": False, "physics": "hard", "use_physics_loss": True, "use_hard_constraint": True},
             # {"type": "kan", "use_kan": True, "physics": "soft", "use_physics_loss": True, "use_hard_constraint": False},
-            # {"type": "kan", "use_kan": True, "physics": "hard", "use_physics_loss": True, "use_hard_constraint": True},
+            {"type": "kan", "use_kan": True, "physics": "hard", "use_physics_loss": True, "use_hard_constraint": True},
             # 使用物理约束的配置 - 课程学习
             # {"type": "mlp", "use_kan": False, "physics": "soft_cl", "use_physics_loss": True, "use_hard_constraint": False, "use_curriculum": True},
             # {"type": "mlp", "use_kan": False, "physics": "hard_cl", "use_physics_loss": True, "use_hard_constraint": True, "use_curriculum": True},
-            {"type": "kan", "use_kan": True, "physics": "soft_cl", "use_physics_loss": True, "use_hard_constraint": False, "use_curriculum": True},
-            {"type": "kan", "use_kan": True, "physics": "hard_cl", "use_physics_loss": True, "use_hard_constraint": True, "use_curriculum": True},
+            # {"type": "kan", "use_kan": True, "physics": "soft_cl", "use_physics_loss": True, "use_hard_constraint": False, "use_curriculum": True},
+            # {"type": "kan", "use_kan": True, "physics": "hard_cl", "use_physics_loss": True, "use_hard_constraint": True, "use_curriculum": True},
         ]
         
         # lambda_physics参数

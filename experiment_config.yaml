@@ -8,7 +8,7 @@ global_settings:
   gbn_test_dir: "data/routenet/gbnbw/tfrecords/evaluate"
   
   # 模型目录基础路径
-  models_base_dir: "fixed_model/0917-opt"
+  models_base_dir: "fixed_model/0922"
   
   # 实验参数
   batch_size: 32
@@ -20,7 +20,7 @@ global_settings:
   num_points: 20
   
   # 输出根目录
-  base_output_dir: "experiment_results/0917-opt"
+  base_output_dir: "experiment_results/0922"
 
 # 模型配置方案（类似train_models.py的结构）
 # 只需要设置 enabled: true 的配置会被实际使用
@@ -37,19 +37,19 @@ model_configs:
   # 使用物理约束的配置 - 传统固定lambda
   - type: "mlp"
     physics: "soft"
-    enabled: true  # 当前不启用传统软约束
+    enabled: true  
     
   - type: "mlp"
     physics: "hard" 
-    enabled: true  # 当前不启用传统硬约束
+    enabled: true  
     
   - type: "kan"
     physics: "soft"
-    enabled: true  # 当前不启用传统软约束
+    enabled: true  
     
   - type: "kan"
     physics: "hard"
-    enabled: true  # 当前不启用传统硬约束
+    enabled: true  
     
   # 使用物理约束的配置 - 课程学习（当前启用的配置）
   - type: "mlp"
@@ -66,7 +66,7 @@ model_configs:
     
   - type: "kan"
     physics: "hard_cl"
-    enabled: false  # 当前不启用KAN硬约束课程学习（模型不存在）
+    enabled: true  
 
 # lambda_physics参数值（会与上述配置组合生成最终模型）
 lambda_values: [0.1]

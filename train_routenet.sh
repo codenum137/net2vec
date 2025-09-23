@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -p g078t
-#SBTACH -N 1
+#SBATCH -N 1
 #SBATCH -n 4
 #SBATCH --gres=gpu:2
-#SBATCH --time=1:00:00
+#SBATCH --time=5:00:00
 #SBATCH --comment=g_group
 ### 指定从哪个项目扣费（即导师所在的项目名称，可以在平台上查看，或者咨询导师）
 

@@ -13,14 +13,20 @@ import datetime
 class KANLayer(tf.keras.layers.Layer):
     """
     KAN (Kolmogorov-Arnold Networks) Layer implementation
-    简化版本，使用可学习的样条函数替代传统激活函数
+    简化版本，默认使用多项式基（1, x, x^2, x^3）作为可学习非线性；
+    可选启用 B 样条基函数（bspline）。
     """
     
-    def __init__(self, units, grid_size=5, spline_order=3, **kwargs):
+    def __init__(self, units, grid_size=5, spline_order=3, basis_type='poly', **kwargs):
         super(KANLayer, self).__init__(**kwargs)
         self.units = units
-        self.grid_size = grid_size
-        self.spline_order = spline_order
+        self.grid_size = grid_size              # B样条网格间隔数量（区间数）
+        self.spline_order = spline_order        # B样条阶次（degree），常用3表示三次
+        self.basis_type = basis_type            # 'poly' 或 'bspline'
+        # 以下在 build() 中根据 basis_type 动态确定
+        self._basis_dim = None
+        self._knots = None
+        self._n_basis = None
         
     def build(self, input_shape):
         input_dim = int(input_shape[-1])
@@ -41,11 +47,39 @@ class KANLayer(tf.keras.layers.Layer):
             trainable=True
         )
         
-        # 样条函数的权重参数
-        # 为每个输入-输出连接学习多项式系数
+        # 确定基函数维度，并在需要时准备B样条结点
+        if self.basis_type == 'bspline':
+            # Open uniform B-spline knots on [0, 1]
+            import numpy as _np
+            degree = int(self.spline_order)
+            n_intervals = int(self.grid_size)
+            # 选择基函数数量（控制点数）：n_basis = n_intervals + degree
+            self._n_basis = n_intervals + degree
+            # 构造 open-uniform knot 向量: [0]*(degree+1), internal uniform, [1]*(degree+1)
+            if n_intervals > 1:
+                internal = _np.linspace(0.0, 1.0, n_intervals + 1, dtype=_np.float32)[1:-1]
+            else:
+                internal = _np.array([], dtype=_np.float32)
+            start = _np.zeros((degree + 1,), dtype=_np.float32)
+            end = _np.ones((degree + 1,), dtype=_np.float32)
+            np_knots = _np.concatenate([start, internal, end], axis=0)  # len = n_basis + degree + 1
+            # 将 knots 注册为不可训练的变量，避免 tf.function 图作用域问题
+            self._knots = self.add_weight(
+                name='bspline_knots',
+                shape=(np_knots.shape[0],),
+                dtype=tf.float32,
+                initializer=tf.keras.initializers.Constant(np_knots),
+                trainable=False
+            )
+            self._basis_dim = self._n_basis
+        else:
+            # 多项式基：1, x, x^2, x^3
+            self._basis_dim = 4
+
+        # 样条/基函数的权重参数：每个输入-输出连接对应 basis_dim 个系数
         self.spline_weights = self.add_weight(
             name='spline_weights',
-            shape=(input_dim, self.units, 4),  # 3次多项式，4个系数
+            shape=(input_dim, self.units, self._basis_dim),
             initializer='glorot_uniform',
             trainable=True
         )
@@ -60,25 +94,83 @@ class KANLayer(tf.keras.layers.Layer):
         
         super(KANLayer, self).build(input_shape)
     
+    def _bspline_basis(self, u):
+        """
+        计算 B 样条基函数值。
+        输入:
+          u: [batch_size, input_dim]，定义域假设在 [0, 1]
+        返回:
+          basis: [batch_size, input_dim, n_basis]
+        """
+        degree = int(self.spline_order)
+        knots = self._knots  # [n_basis + degree + 1]
+        n_basis = int(self._n_basis)
+
+        # 基础的0次基函数 B_{i,0}
+        # 对每个 i (0..n_basis-1): 1 if knots[i] <= u < knots[i+1] else 0
+        # 处理 u==1 的边界（归属到最后一个基函数）
+        u_exp = tf.expand_dims(u, axis=-1)  # [B, D, 1]
+        t_i = tf.reshape(knots[:n_basis], [1, 1, n_basis])
+        t_ip1 = tf.reshape(knots[1:n_basis+1], [1, 1, n_basis])
+
+        left = tf.cast(u_exp >= t_i, tf.float32)
+        right = tf.cast(u_exp < t_ip1, tf.float32)
+        B = left * right  # [B, D, n_basis]
+
+        # 特殊处理 u==1.0: 令最后一个基函数为1
+        is_one = tf.equal(u_exp, 1.0)
+        any_one = tf.cast(is_one, tf.float32)
+        last_hot = tf.one_hot(n_basis - 1, n_basis, dtype=tf.float32)  # [n_basis]
+        last_hot = tf.reshape(last_hot, [1, 1, n_basis])
+        B = tf.where(tf.reduce_any(is_one, axis=-1, keepdims=True), last_hot, B)
+
+        # 递推计算高阶基函数
+        for k in range(1, degree + 1):
+            # denom1: t_{i+k} - t_i,  i=0..n_basis-1
+            t_i_k = tf.reshape(knots[k:n_basis + k], [1, 1, n_basis])
+            denom1 = t_i_k - t_i
+            # denom2: t_{i+k+1} - t_{i+1}
+            t_ip1_k1 = tf.reshape(knots[k+1:n_basis + k + 1], [1, 1, n_basis])
+            denom2 = t_ip1_k1 - t_ip1
+
+            # term1 = ((u - t_i)/denom1) * B_{i,k-1}
+            numer1 = u_exp - t_i
+            coef1 = tf.where(denom1 > 0, numer1 / (denom1 + 1e-12), tf.zeros_like(denom1))
+            term1 = coef1 * B
+
+            # term2 = ((t_{i+k+1} - u)/denom2) * B_{i+1,k-1}
+            numer2 = t_ip1_k1 - u_exp
+            coef2 = tf.where(denom2 > 0, numer2 / (denom2 + 1e-12), tf.zeros_like(denom2))
+            # B shifted: B_{i+1,k-1}
+            B_shift = tf.concat([B[..., 1:], tf.zeros_like(B[..., :1])], axis=-1)
+            term2 = coef2 * B_shift
+
+            B = term1 + term2
+
+        return B  # [B, D, n_basis]
+
     def call(self, inputs, training=None):
         # 基础线性变换
         linear_output = tf.matmul(inputs, self.base_weight) + self.bias  # [batch_size, units]
         
-        # 非线性样条变换
-        # 将输入标准化到[-1, 1]范围
-        x_normalized = tf.tanh(inputs)  # [batch_size, input_dim]
+        # 非线性变换：多项式或B样条
+        # 将输入标准化
+        x_tanh = tf.tanh(inputs)  # [-1, 1]
+        if self.basis_type == 'bspline':
+            # remap to [0,1]
+            u = (x_tanh + 1.0) * 0.5
+            basis = self._bspline_basis(u)  # [B, D, n_basis]
+        else:
+            # 多项式基函数：1, x, x^2, x^3
+            basis = tf.stack([
+                tf.ones_like(x_tanh),
+                x_tanh,
+                tf.square(x_tanh),
+                tf.pow(x_tanh, 3)
+            ], axis=-1)  # [B, D, 4]
         
-        # 计算多项式基函数：1, x, x^2, x^3
-        x_powers = tf.stack([
-            tf.ones_like(x_normalized),
-            x_normalized,
-            tf.square(x_normalized),
-            tf.pow(x_normalized, 3)
-        ], axis=-1)  # [batch_size, input_dim, 4]
-        
-        # 样条输出计算：[batch_size, input_dim, 4] @ [input_dim, units, 4] -> [batch_size, input_dim, units]
-        # 使用 einsum 进行高效的张量乘法
-        spline_contributions = tf.einsum('bid,ijd->bij', x_powers, self.spline_weights)  # [batch_size, input_dim, units]
+        # 样条/基函数输出：[B, D, basis] @ [D, U, basis] -> [B, D, U]
+        spline_contributions = tf.einsum('bid,ijd->bij', basis, self.spline_weights)  # [batch_size, input_dim, units]
         
         # 应用门控权重并求和
         gated_splines = spline_contributions * tf.expand_dims(self.gate_weights, 0)  # [batch_size, input_dim, units]
@@ -101,6 +193,7 @@ class KANLayer(tf.keras.layers.Layer):
             'units': self.units,
             'grid_size': self.grid_size,
             'spline_order': self.spline_order,
+            'basis_type': self.basis_type,
         })
         return config
 
@@ -248,7 +341,12 @@ class RouteNet(tf.keras.Model):
         if use_kan:
             readout_layers = []
             for i in range(config['readout_layers']):
-                readout_layers.append(KANLayer(config['readout_units']))
+                readout_layers.append(KANLayer(
+                    config['readout_units'],
+                    grid_size=config.get('kan_grid_size', 5),
+                    spline_order=config.get('kan_spline_order', 3),
+                    basis_type=config.get('kan_basis', 'poly')
+                ))
                 if i < config['readout_layers'] - 1:  # 不在最后一层添加dropout
                     readout_layers.append(tf.keras.layers.Dropout(0.1))
             self.readout = tf.keras.Sequential(readout_layers)
@@ -397,7 +495,10 @@ class PhysicsInformedRouteNet(tf.keras.Model):
         
         print(f"Created PhysicsInformedRouteNet:")
         print(f"  - Target: {target}")
-        print(f"  - Architecture: {'KAN' if use_kan else 'MLP'}")
+        if use_kan:
+            print(f"  - Architecture: KAN (basis={config.get('kan_basis', 'poly')}, grid={config.get('kan_grid_size', 5)}, order={config.get('kan_spline_order', 3)})")
+        else:
+            print(f"  - Architecture: MLP")
         print(f"  - Physics Loss: {use_physics_loss}")
         if use_physics_loss:
             constraint_type = "Hard" if use_hard_constraint else "Soft"
@@ -934,6 +1035,10 @@ def main(args):
         'readout_layers': 2,
         'l2': 0.1,
         'l2_2': 0.01,
+        # KAN 参数默认值（当使用KAN时生效）
+        'kan_basis': 'poly',        # 'poly' 或 'bspline'
+        'kan_grid_size': 5,         # B样条间隔数，只有在bspline时使用
+        'kan_spline_order': 3,      # B样条阶次（degree），典型为3
     }
 
     # 设置 TensorBoard 日志目录，包含target和KAN信息
@@ -956,6 +1061,14 @@ def main(args):
     print("Found {} evaluation files.".format(len(eval_files)))
 
     # 根据target创建模型和损失函数
+    # 将 CLI 的 KAN 参数写入 config（仅当用户传入时覆盖默认值）
+    if args.kan_basis is not None:
+        config['kan_basis'] = args.kan_basis
+    if args.kan_grid_size is not None:
+        config['kan_grid_size'] = args.kan_grid_size
+    if args.kan_spline_order is not None:
+        config['kan_spline_order'] = args.kan_spline_order
+
     model, loss_fn = create_model_and_loss_fn(config, args.target, 
                                              use_kan=args.kan, 
                                              use_physics_loss=args.physics_loss,
@@ -1270,6 +1383,13 @@ if __name__ == '__main__':
                       help='Training target: "delay" for delay prediction, "drops" for packet drop prediction')
     parser.add_argument('--kan', action='store_true', 
                       help='Use KAN (Kolmogorov-Arnold Networks) instead of traditional MLP for readout layers')
+    # KAN 参数
+    parser.add_argument('--kan_basis', type=str, choices=['poly', 'bspline'], default=None,
+                      help='KAN basis type for readout: poly (default) or bspline')
+    parser.add_argument('--kan_grid_size', type=int, default=None,
+                      help='Number of intervals for B-spline grid (only for bspline basis)')
+    parser.add_argument('--kan_spline_order', type=int, default=None,
+                      help='Degree/order of B-spline basis (only for bspline basis)')
     parser.add_argument('--epochs', type=int, default=10,
                       help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=32,
