@@ -13,11 +13,11 @@ import json
 from datetime import datetime
 from pathlib import Path
 import argparse
+import re
 
 class ModelTrainer:
-    def __init__(self, base_dir="./", force_retrain=False, enable_early_stopping=True, epochs=40, early_stopping_patience=8):
+    def __init__(self, base_dir="./", force_retrain=False, enable_early_stopping=True, epochs=40, early_stopping_patience=8, tf_compat='auto'):
         self.base_dir = Path(base_dir)
-        self.train_script = self.base_dir / "routenet" / "routenet_tf2.py"
         self.train_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "train"
         self.eval_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "evaluate"
         self.models_base_dir = self.base_dir / "fixed_model/0924"
@@ -25,6 +25,13 @@ class ModelTrainer:
         self.enable_early_stopping = enable_early_stopping  # 是否启用早停机制
         self.epochs = epochs  # 训练轮数
         self.early_stopping_patience = early_stopping_patience  # 早停耐心值
+        self.tf_compat = tf_compat  # 'auto' | 'tf2' | 'tf2_9'
+
+        # 自动检测 TensorFlow 版本并选择对应训练脚本
+        self.tf_version = self._detect_tf_version()
+        self.train_script = self._select_train_script(self.tf_version, self.tf_compat)
+        print(f"🧪 TensorFlow version detected: {self.tf_version or 'unknown'}")
+        print(f"🧠 Using training entry script: {self.train_script}")
         
         # 训练配置
         self.training_configs = self._generate_training_configs()
@@ -65,6 +72,42 @@ class ModelTrainer:
         return configs
     
     # 过去用于组合物理约束模型目录的函数已不再需要（仅训练 none 类配置）
+    
+    def _detect_tf_version(self):
+        """尝试检测当前环境中的 TensorFlow 版本。失败时返回 None。"""
+        try:
+            import tensorflow as tf  # noqa: F401
+            ver = getattr(tf, '__version__', None)
+            return ver
+        except Exception:
+            return None
+
+    def _select_train_script(self, tf_version, override):
+        """根据 TensorFlow 版本或用户覆盖选择训练脚本。"""
+        tf2_path = self.base_dir / "routenet" / "routenet_tf2.py"
+        tf29_path = self.base_dir / "routenet" / "routenet_tf2_9.py"
+
+        # 处理覆盖
+        if override == 'tf2':
+            return tf2_path
+        if override == 'tf2_9':
+            return tf29_path
+
+        # 自动判断
+        if not tf_version:
+            # 未能检测版本，默认使用新版脚本
+            return tf2_path
+        # 解析主次版本号
+        m = re.match(r"^(\d+)\.(\d+)", tf_version)
+        if not m:
+            return tf2_path
+        major = int(m.group(1))
+        minor = int(m.group(2))
+        if major < 2:
+            return tf29_path
+        if major == 2 and minor <= 9:
+            return tf29_path
+        return tf2_path
     
     def _build_training_command(self, config):
         """构建训练命令"""
@@ -423,6 +466,8 @@ def main():
     # 早停相关参数
     parser.add_argument("--no-early-stopping", action="store_true", help="禁用早停机制")
     parser.add_argument("--early-stopping-patience", type=int, default=8, help="早停耐心值 (默认: 8)")
+    # TF 版本兼容选择
+    parser.add_argument("--tf-compat", choices=['auto', 'tf2', 'tf2_9'], default='auto', help="训练脚本选择：auto 根据TF版本自动选择；tf2 使用 routenet_tf2.py；tf2_9 使用 routenet_tf2_9.py")
     
     args = parser.parse_args()
     
@@ -439,7 +484,8 @@ def main():
         base_dir=args.base_dir, 
         force_retrain=args.force,
         enable_early_stopping=not args.no_early_stopping,
-        early_stopping_patience=args.early_stopping_patience
+        early_stopping_patience=args.early_stopping_patience,
+        tf_compat=args.tf_compat,
     )
     
     if args.list:
