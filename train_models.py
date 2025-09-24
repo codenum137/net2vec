@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-RouteNet模型串行训练脚本
-支持软硬物理限制、MLP/KAN、不同lambda_physics参数的组合训练
+RouteNet模型串行训练脚本（无物理/梯度约束）
+仅训练三类模型：MLP、KAN-Poly、KAN-Bspline
 """
 
 import os
@@ -14,14 +15,15 @@ from pathlib import Path
 import argparse
 
 class ModelTrainer:
-    def __init__(self, base_dir="./", force_retrain=False, enable_early_stopping=True, early_stopping_patience=5):
+    def __init__(self, base_dir="./", force_retrain=False, enable_early_stopping=True, epochs=40, early_stopping_patience=8):
         self.base_dir = Path(base_dir)
         self.train_script = self.base_dir / "routenet" / "routenet_tf2.py"
         self.train_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "train"
         self.eval_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "evaluate"
-        self.models_base_dir = self.base_dir / "fixed_model/0922"
+        self.models_base_dir = self.base_dir / "fixed_model/0924"
         self.force_retrain = force_retrain  # 是否强制重新训练已存在的模型
         self.enable_early_stopping = enable_early_stopping  # 是否启用早停机制
+        self.epochs = epochs  # 训练轮数
         self.early_stopping_patience = early_stopping_patience  # 早停耐心值
         
         # 训练配置
@@ -29,100 +31,51 @@ class ModelTrainer:
         
     def _generate_training_configs(self):
         """生成所有训练配置组合"""
+        # 仅关注三类模型：mlp_none, kan_none, kan_bspline
         configs = []
-        
-        # 模型类型和物理限制组合
-        model_configs = [
-            # # 不使用物理约束的配置
-            # {"type": "mlp", "use_kan": False, "physics": "none", "use_physics_loss": False, "use_hard_constraint": False},
-            # {"type": "kan", "use_kan": True, "physics": "none", "use_physics_loss": False, "use_hard_constraint": False},
-            # # 使用物理约束的配置 - 传统固定lambda
-            # {"type": "mlp", "use_kan": False, "physics": "soft", "use_physics_loss": True, "use_hard_constraint": False},
-            # {"type": "mlp", "use_kan": False, "physics": "hard", "use_physics_loss": True, "use_hard_constraint": True},
-            # {"type": "kan", "use_kan": True, "physics": "soft", "use_physics_loss": True, "use_hard_constraint": False},
-            {"type": "kan", "use_kan": True, "physics": "hard", "use_physics_loss": True, "use_hard_constraint": True},
-            # 使用物理约束的配置 - 课程学习
-            # {"type": "mlp", "use_kan": False, "physics": "soft_cl", "use_physics_loss": True, "use_hard_constraint": False, "use_curriculum": True},
-            # {"type": "mlp", "use_kan": False, "physics": "hard_cl", "use_physics_loss": True, "use_hard_constraint": True, "use_curriculum": True},
-            # {"type": "kan", "use_kan": True, "physics": "soft_cl", "use_physics_loss": True, "use_hard_constraint": False, "use_curriculum": True},
-            # {"type": "kan", "use_kan": True, "physics": "hard_cl", "use_physics_loss": True, "use_hard_constraint": True, "use_curriculum": True},
-        ]
-        
-        # lambda_physics参数
-        lambda_values = [0.1]
-        
-        for model_config in model_configs:
-            if model_config["use_physics_loss"]:
-                # 使用物理约束的配置：生成多个lambda值
-                for lambda_val in lambda_values:
-                    # 课程学习配置
-                    if model_config.get("use_curriculum", False):
-                        config = {
-                            "name": f"{model_config['type']}_{model_config['physics']}_{lambda_val}",
-                            "model_type": model_config["type"],
-                            "use_kan": model_config["use_kan"],
-                            "physics_type": model_config["physics"],
-                            "use_physics_loss": model_config["use_physics_loss"],
-                            "use_hard_constraint": model_config["use_hard_constraint"],
-                            "lambda_physics": lambda_val,  # 这将作为max_lambda使用
-                            "use_curriculum": True,
-                            "warmup_epochs": 5,  # 热身期默认5轮
-                            "ramp_epochs": 10,   # 增长期默认10轮
-                            "max_lambda": lambda_val,  # 最大lambda值
-                            "model_dir": self._get_model_dir(model_config, lambda_val),
-                        }
-                        configs.append(config)
-                    else:
-                        # 传统固定lambda配置
-                        config = {
-                            "name": f"{model_config['type']}_{model_config['physics']}_{lambda_val}",
-                            "model_type": model_config["type"],
-                            "use_kan": model_config["use_kan"],
-                            "physics_type": model_config["physics"],
-                            "use_physics_loss": model_config["use_physics_loss"],
-                            "use_hard_constraint": model_config["use_hard_constraint"],
-                            "lambda_physics": lambda_val,
-                            "use_curriculum": False,
-                            "model_dir": self._get_model_dir(model_config, lambda_val),
-                        }
-                        configs.append(config)
-            else:
-                # 不使用物理约束的配置：只生成一个配置
-                config = {
-                    "name": f"{model_config['type']}_{model_config['physics']}",
-                    "model_type": model_config["type"],
-                    "use_kan": model_config["use_kan"],
-                    "physics_type": model_config["physics"],
-                    "use_physics_loss": model_config["use_physics_loss"],
-                    "use_hard_constraint": model_config["use_hard_constraint"],
-                    "lambda_physics": 0.0,  # 不使用物理约束时lambda值无意义
-                    "use_curriculum": False,
-                    "model_dir": self._get_model_dir(model_config, None),
-                }
-                configs.append(config)
-        
+
+        # 1) MLP baseline (no physics, no KAN)
+        configs.append({
+            "name": "mlp_none",
+            "model_type": "mlp",
+            "use_kan": False,
+            "model_dir": self.models_base_dir / "mlp_none",
+        })
+
+        # 2) KAN baseline with polynomial basis (no physics)
+        configs.append({
+            "name": "kan_none",
+            "model_type": "kan",
+            "use_kan": True,
+            "model_dir": self.models_base_dir / "kan_none",
+        })
+
+        # 3) KAN with B-spline basis (no physics)
+        configs.append({
+            "name": "kan_bspline",
+            "model_type": "kan",
+            "use_kan": True,
+            "model_dir": self.models_base_dir / "kan_bspline",
+            # KAN basis parameters
+            "kan_basis": "bspline",
+            "kan_grid_size": 5,
+            "kan_spline_order": 3,
+        })
+
         return configs
     
-    def _get_model_dir(self, model_config, lambda_val):
-        """生成模型保存目录 - 优化后的简洁结构"""
-        # 使用 fixed_model 作为根目录
-        if lambda_val is None:
-            # 不使用物理约束的情况
-            model_dir = self.models_base_dir / f"{model_config['type']}_{model_config['physics']}"
-        else:
-            # 使用物理约束的情况
-            model_dir = self.models_base_dir / f"{model_config['type']}_{model_config['physics']}_{lambda_val}"
-        return model_dir
+    # 过去用于组合物理约束模型目录的函数已不再需要（仅训练 none 类配置）
     
     def _build_training_command(self, config):
         """构建训练命令"""
+        # 使用当前解释器，确保与已激活的环境一致
         cmd = [
-            "python", str(self.train_script),
+            sys.executable, str(self.train_script),
             "--train_dir", str(self.train_data_dir),
             "--eval_dir", str(self.eval_data_dir),
             "--model_dir", str(config["model_dir"]),
             "--target", "delay",
-            "--epochs", "20",  # 增加训练轮数以获得更好效果
+            "--epochs", str(self.epochs),  # 使用配置中的训练轮数
             "--batch_size", "32",
             "--lr_schedule", "plateau",
             "--learning_rate", "0.001",
@@ -131,35 +84,24 @@ class ModelTrainer:
 
         ]
         
-        # 添加物理损失相关参数（仅在使用物理约束时）
-        if config["use_physics_loss"]:
-            cmd.extend(["--physics_loss"])
-            
-            # 课程学习参数
-            if config.get("use_curriculum", False):
-                cmd.extend([
-                    "--curriculum",
-                    "--warmup_epochs", str(config.get("warmup_epochs", 5)),
-                    "--ramp_epochs", str(config.get("ramp_epochs", 10)),
-                    "--max_lambda", str(config.get("max_lambda", config["lambda_physics"]))
-                ])
-            else:
-                # 传统固定lambda
-                cmd.extend(["--lambda_physics", str(config["lambda_physics"])])
-            
-            # 添加约束类型参数
-            if config["use_hard_constraint"]:
-                cmd.append("--hard_physics")
-            
         # 添加KAN相关参数
         if config["use_kan"]:
-            cmd.append("--kan")  # 修正参数名：使用 --kan 而不是 --use_kan
+            cmd.append("--kan")  # 使用 KAN 读出层
+            # 传递 KAN 基函数参数（如有）
+            kb = config.get("kan_basis")
+            if kb:
+                cmd.extend(["--kan_basis", str(kb)])
+                if kb == "bspline":
+                    if "kan_grid_size" in config:
+                        cmd.extend(["--kan_grid_size", str(config["kan_grid_size"])])
+                    if "kan_spline_order" in config:
+                        cmd.extend(["--kan_spline_order", str(config["kan_spline_order"])])
         
         # 添加早停机制参数
         if self.enable_early_stopping:
             cmd.extend([
                 "--early_stopping",
-                "--early_stopping_patience", str(8 if config.get("use_curriculum", False) else self.early_stopping_patience),
+                "--early_stopping_patience", str(self.early_stopping_patience),
                 "--early_stopping_min_delta", "1e-6",
                 "--early_stopping_restore_best"
             ])
@@ -173,11 +115,14 @@ class ModelTrainer:
         print(f"📁 模型目录: {config['model_dir']}")
         
         # 构建配置描述
-        config_desc = f"{config['model_type'].upper()}, {config['physics_type']}"
-        if config.get("use_curriculum", False):
-            config_desc += f", 课程学习(max_λ={config.get('max_lambda', config['lambda_physics'])})"
+        if config.get("use_kan"):
+            kb = config.get("kan_basis", "poly")
+            if kb == "bspline":
+                config_desc = f"KAN (basis=bspline, grid={config.get('kan_grid_size', 5)}, order={config.get('kan_spline_order', 3)})"
+            else:
+                config_desc = "KAN (basis=poly)"
         else:
-            config_desc += f", λ={config['lambda_physics']}"
+            config_desc = "MLP"
         
         print(f"⚙️  配置: {config_desc}")
         print(f"{'='*60}")
@@ -227,7 +172,7 @@ class ModelTrainer:
             # 监控输出：控制台显示epoch进度，日志文件保存详细输出
             output_lines = []
             current_epoch = 0
-            total_epochs = 20  # 从命令中获取的epoch数
+            total_epochs = self.epochs
             
             # 打开日志文件
             with open(log_file, 'w', encoding='utf-8') as log_f:
@@ -373,23 +318,16 @@ class ModelTrainer:
         result = {
             "config": config["name"],
             "model_type": config["model_type"],
-            "physics_type": config["physics_type"],
-            "lambda_physics": config["lambda_physics"],
-            "use_curriculum": config.get("use_curriculum", False),
+            "use_kan": config.get("use_kan", False),
+            "kan_basis": config.get("kan_basis"),
+            "kan_grid_size": config.get("kan_grid_size"),
+            "kan_spline_order": config.get("kan_spline_order"),
             "success": success,
             "duration": duration,
             "timestamp": datetime.now().isoformat(),
             "stdout": stdout,
             "stderr": stderr
         }
-        
-        # 添加课程学习相关参数
-        if config.get("use_curriculum", False):
-            result.update({
-                "warmup_epochs": config.get("warmup_epochs", 5),
-                "ramp_epochs": config.get("ramp_epochs", 10),
-                "max_lambda": config.get("max_lambda", config["lambda_physics"])
-            })
         
         # 保存到模型目录
         result_file = config["model_dir"] / "training_result.json"
@@ -413,7 +351,12 @@ class ModelTrainer:
         # 显示所有配置
         print(f"\n📋 训练配置列表:")
         for i, config in enumerate(self.training_configs, 1):
-            print(f"  {i:2d}. {config['name']} - {config['model_type'].upper()}, {config['physics_type']}, λ={config['lambda_physics']}")
+            if config.get('use_kan'):
+                kb = config.get('kan_basis', 'poly')
+                basis_desc = 'bspline' if kb == 'bspline' else 'poly'
+                print(f"  {i:2d}. {config['name']} - KAN ({basis_desc})")
+            else:
+                print(f"  {i:2d}. {config['name']} - MLP")
         
         # 过滤要训练的模型
         configs_to_train = self.training_configs.copy()
@@ -466,15 +409,12 @@ class ModelTrainer:
         for i, config in enumerate(self.training_configs, 1):
             print(f"  {i:2d}. {config['name']}")
             print(f"      模型类型: {config['model_type'].upper()}")
-            print(f"      物理限制: {config['physics_type']}")
-            
-            # 显示lambda信息
-            if config.get("use_curriculum", False):
-                print(f"      课程学习: 启用 (max_λ={config.get('max_lambda', config['lambda_physics'])})")
-                print(f"      热身期: {config.get('warmup_epochs', 5)} 轮")
-                print(f"      增长期: {config.get('ramp_epochs', 10)} 轮")
-            else:
-                print(f"      Lambda值: {config['lambda_physics']}")
+            if config.get('use_kan'):
+                kb = config.get('kan_basis', 'poly')
+                if kb == 'bspline':
+                    print(f"      KAN基函数: bspline (grid={config.get('kan_grid_size', 5)}, order={config.get('kan_spline_order', 3)})")
+                else:
+                    print("      KAN基函数: poly")
                 
             print(f"      模型目录: {config['model_dir']}")
             print()
@@ -489,10 +429,18 @@ def main():
     parser.add_argument("--yes", "-y", action="store_true", help="自动确认训练，无需手动输入")
     # 早停相关参数
     parser.add_argument("--no-early-stopping", action="store_true", help="禁用早停机制")
-    parser.add_argument("--early-stopping-patience", type=int, default=5, help="早停耐心值 (默认: 5)")
+    parser.add_argument("--early-stopping-patience", type=int, default=8, help="早停耐心值 (默认: 8)")
     
     args = parser.parse_args()
     
+    # 打印当前 Python 解释器与 Conda 环境信息，帮助排查环境问题
+    try:
+        conda_env = os.environ.get('CONDA_DEFAULT_ENV', 'N/A')
+        print(f"🐍 Python: {sys.executable}")
+        print(f"📦 Conda env: {conda_env}")
+    except Exception:
+        pass
+
     # 创建trainer，传入早停相关参数
     trainer = ModelTrainer(
         base_dir=args.base_dir, 

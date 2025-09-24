@@ -18,9 +18,8 @@ import seaborn as sns
 import sys
 sys.path.append(os.path.dirname(__file__))
 from routenet_tf2 import (
-    RouteNet, create_dataset, parse_fn, transformation_func,
+    RouteNet, create_dataset,
     scale_fn, heteroscedastic_loss, binomial_loss, create_model_and_loss_fn,
-    PhysicsInformedRouteNet
 )
 
 def load_model(model_dir, target, config, use_kan=False):
@@ -63,41 +62,17 @@ def load_model(model_dir, target, config, use_kan=False):
     if weight_path is None:
         raise FileNotFoundError("No model weights found in {}".format(model_dir))
     
-    # 尝试使用新的PhysicsInformedRouteNet加载，如果失败则使用旧的方式
-    try:
-        # 先尝试新的模型结构 (PhysicsInformedRouteNet)
-        model = PhysicsInformedRouteNet(
-            config=config,
-            target=target,
-            use_kan=use_kan,
-            use_physics_loss=False,  # 评估时不需要物理约束
-            use_hard_constraint=False,
-            lambda_physics=0.0,
-            use_curriculum=False
-        )
-        if use_kan:
-            kb = config.get('kan_basis', 'poly')
-            if kb == 'bspline':
-                print(f"Using PhysicsInformedRouteNet (KAN bspline) for {target} evaluation")
-            else:
-                print(f"Using PhysicsInformedRouteNet (KAN poly) for {target} evaluation")
-        else:
-            print(f"Using PhysicsInformedRouteNet (MLP) for {target} evaluation")
-        return model, weight_path
-        
-    except Exception as e:
-        print(f"Failed to create PhysicsInformedRouteNet: {e}, falling back to original model")
-        # 回退到旧的模型创建方式
-        from routenet_tf2 import create_model_and_loss_fn
-        
-        # 使用旧的模型创建方式
+    # 简化：仅使用标准模型创建方式（MLP 或 KAN，包括 B-spline）
     model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
-    print(f"Using legacy model for {target} evaluation")
-    return model, weight_path
-    
     model_type = "KAN" if use_kan else "MLP"
+    kb = config.get('kan_basis', 'poly') if use_kan else None
+    if use_kan and kb == 'bspline':
+        print(f"Using KAN (bspline) for {target} evaluation")
+    elif use_kan:
+        print(f"Using KAN (poly) for {target} evaluation")
+    else:
+        print(f"Using MLP for {target} evaluation")
     print("Loading {} {} model weights from: {}".format(model_type, target, weight_path))
-    
     return model, weight_path
 
 def evaluate_delay_jitter_model(model, dataset, num_samples=None):
@@ -121,11 +96,7 @@ def evaluate_delay_jitter_model(model, dataset, num_samples=None):
     
     for features, labels in tqdm(dataset, desc="Evaluating delay/jitter model"):
         # 模型预测 - 异方差输出：[loc, scale]
-        # 根据模型类型选择正确的调用方式
-        if isinstance(model, PhysicsInformedRouteNet):
-            pred = model.routenet(features, training=False)
-        else:
-            pred = model(features, training=False)
+        pred = model(features, training=False)
         
         pred_delay = pred[:, 0].numpy()  # 延迟预测均值 (loc)
         
@@ -187,11 +158,7 @@ def evaluate_drops_model(model, dataset, num_samples=None):
     
     for features, labels in tqdm(dataset, desc="Evaluating drops model"):
         # 模型预测 - 输出 logits
-        # 根据模型类型选择正确的调用方式
-        if isinstance(model, PhysicsInformedRouteNet):
-            pred_logits = model.routenet(features, training=False)
-        else:
-            pred_logits = model(features, training=False)
+        pred_logits = model(features, training=False)
         pred_probs = tf.nn.sigmoid(pred_logits[:, 0]).numpy()
         
         # 收集真实值
@@ -425,41 +392,15 @@ def main():
     # 初始化模型权重（需要先运行一次前向传播）
     print("\nInitializing models...")
     
-    # 检查模型类型并相应处理
-    if isinstance(delay_model, PhysicsInformedRouteNet):
-        # 对于PhysicsInformedRouteNet，需要先进行完整的前向传播来构建模型
-        for dataset in [nsfnet_dataset.take(1)]:
-            for features, labels in dataset:
-                # 使用完整的调用路径来确保模型被正确构建
-                _ = delay_model(features, training=False)
-                break
-    else:
-        # 对于传统模型
-        for dataset in [nsfnet_dataset.take(1)]:
-            for features, labels in dataset:
-                _ = delay_model(features, training=False)
-                break
+    # 进行一次前向传播以构建模型
+    for dataset in [nsfnet_dataset.take(1)]:
+        for features, labels in dataset:
+            _ = delay_model(features, training=False)
+            break
     
     # 加载权重
-    try:
-        delay_model.load_weights(delay_weight_path)
-        print("Models loaded successfully!")
-    except Exception as e:
-        print(f"Failed to load weights: {e}")
-        # 尝试加载到子模型
-        if isinstance(delay_model, PhysicsInformedRouteNet):
-            try:
-                delay_model.routenet.load_weights(delay_weight_path)
-                print("Weights loaded to routenet submodel successfully!")
-            except Exception as e2:
-                print(f"Failed to load weights to routenet submodel: {e2}")
-                # 最后尝试：手动构建模型结构
-                print("Attempting manual model building...")
-                delay_model.routenet.build(input_shape=[(None, None, None), (None, None)])
-                delay_model.routenet.load_weights(delay_weight_path)
-                print("Weights loaded after manual building!")
-        else:
-            raise e
+    delay_model.load_weights(delay_weight_path)
+    print("Model loaded successfully!")
     
     # 评估NSFNet（同拓扑）
     print("\n" + "="*50)

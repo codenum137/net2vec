@@ -18,7 +18,6 @@ sys.path.append(os.path.dirname(__file__))
 from routenet_tf2 import (
     RouteNet, create_dataset, parse_fn, transformation_func,
     scale_fn, heteroscedastic_loss, binomial_loss, create_model_and_loss_fn,
-    PhysicsInformedRouteNet
 )
 
 def calculate_r2(y_pred, y_true):
@@ -98,9 +97,7 @@ def calculate_nll(y_pred_mean, y_pred_scale, y_true):
     return np.mean(nll_per_sample)
 
 def load_model(model_dir, target, config, use_kan=False):
-    """
-    加载指定目标的模型，兼容新的 PhysicsInformedRouteNet 结构
-    """
+    """加载指定目标的标准模型（MLP 或 KAN，包括 B-spline）。"""
     # 寻找权重文件
     if use_kan:
         weight_files = [
@@ -124,27 +121,17 @@ def load_model(model_dir, target, config, use_kan=False):
     if weight_path is None:
         raise FileNotFoundError("No model weights found in {}".format(model_dir))
     
-    # 尝试使用新的PhysicsInformedRouteNet加载，如果失败则使用旧的方式
-    try:
-        # 先尝试新的模型结构 (PhysicsInformedRouteNet)
-        model = PhysicsInformedRouteNet(
-            config=config,  # 添加 config 参数
-            target=target,
-            use_kan=use_kan,
-            use_physics_loss=False,  # 评估时不需要物理约束
-            use_hard_constraint=False,
-            lambda_physics=0.0,
-            use_curriculum=False
-        )
-        print(f"Using PhysicsInformedRouteNet for {target} evaluation")
-    except Exception as e:
-        print(f"Failed to create PhysicsInformedRouteNet: {e}, falling back to original model")
-        # 回退到旧的模型创建方式
-        model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
-    
+    # 使用标准模型创建方式
+    model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
     model_type = "KAN" if use_kan else "MLP"
+    kb = config.get('kan_basis', 'poly') if use_kan else None
+    if use_kan and kb == 'bspline':
+        print(f"Using KAN (bspline) for {target} evaluation")
+    elif use_kan:
+        print(f"Using KAN (poly) for {target} evaluation")
+    else:
+        print(f"Using MLP for {target} evaluation")
     print("Loading {} {} model weights from: {}".format(model_type, target, weight_path))
-    
     return model, weight_path
 
 def evaluate_model_metrics(model, dataset, dataset_name, num_samples=None):
@@ -390,6 +377,13 @@ def main():
                       help='Limit number of samples to evaluate')
     parser.add_argument('--kan', action='store_true',
                       help='Evaluate KAN-based models instead of traditional MLP models')
+    # KAN basis options (optional; only used when --kan is set)
+    parser.add_argument('--kan_basis', type=str, choices=['poly', 'bspline'], default=None,
+                      help='KAN basis type for readout: poly (default) or bspline')
+    parser.add_argument('--kan_grid_size', type=int, default=None,
+                      help='Number of intervals for B-spline grid (only for bspline basis)')
+    parser.add_argument('--kan_spline_order', type=int, default=None,
+                      help='Degree/order of B-spline basis (only for bspline basis)')
     
     args = parser.parse_args()
     
@@ -407,8 +401,31 @@ def main():
         'l2_2': 0.01,
     }
     
+    # 如果评估 KAN 模型，写入可选的基函数配置；支持从目录名推断 bspline
+    if args.kan:
+        inferred_basis = None
+        if args.kan_basis is None:
+            mdl = args.model_dir.lower()
+            if 'bspline' in mdl or 'b_spline' in mdl or 'b-spline' in mdl:
+                inferred_basis = 'bspline'
+        basis = args.kan_basis or inferred_basis or 'poly'
+        config['kan_basis'] = basis
+        if basis == 'bspline':
+            if args.kan_grid_size is not None:
+                config['kan_grid_size'] = args.kan_grid_size
+            if args.kan_spline_order is not None:
+                config['kan_spline_order'] = args.kan_spline_order
+
     model_type = "KAN" if args.kan else "MLP"
-    print(f"Starting numerical analysis for {model_type} model...")
+    if args.kan:
+        kb = config.get('kan_basis', 'poly')
+        if kb == 'bspline':
+            suffix = f" (basis=bspline, grid={config.get('kan_grid_size', 5)}, order={config.get('kan_spline_order', 3)})"
+        else:
+            suffix = " (basis=poly)"
+    else:
+        suffix = ""
+    print(f"Starting numerical analysis for {model_type} model{suffix}...")
     print(f"Model dir: {args.model_dir}")
     print(f"NSFNet test dir: {args.nsfnet_test_dir}")
     print(f"GBN test dir: {args.gbn_test_dir}")

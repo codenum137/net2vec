@@ -48,54 +48,47 @@ class ExperimentRunner:
         print("🔧 检测到 model_configs，自动生成模型配置...")
         
         model_configs = config.get('model_configs', [])
-        lambda_values = config.get('lambda_values', [0.1])
         
         generated_models = {}
         
         for model_config in model_configs:
             if not model_config.get('enabled', True):
-                print(f"⏭️  跳过禁用的配置: {model_config['type']}_{model_config['physics']}")
+                # 兼容无 physics 字段的配置
+                physics = model_config.get('physics', 'none')
+                print(f"⏭️  跳过禁用的配置: {model_config['type']}_{physics}")
                 continue
-                
-            for lambda_val in lambda_values:
-                # 生成模型名称
-                if model_config['physics'] == 'none':
-                    model_name = f"{model_config['type']}_{model_config['physics']}"
-                else:
-                    model_name = f"{model_config['type']}_{model_config['physics']}_{lambda_val}"
-                
-                # 生成模型配置
-                model_def = {
-                    'model_type': model_config['type'],
-                    'physics_type': model_config['physics'],
-                    'lambda_physics': 0.0 if model_config['physics'] == 'none' else lambda_val,
-                    'delay_model_dir': model_name,
-                    'use_kan': model_config['type'] == 'kan'  # 自动推断use_kan
-                }
-                
-                # 添加物理约束相关配置
-                if model_config['physics'] != 'none':
-                    model_def.update({
-                        'use_physics_loss': True,
-                        'use_hard_constraint': 'hard' in model_config['physics']
-                    })
-                else:
-                    model_def.update({
-                        'use_physics_loss': False,
-                        'use_hard_constraint': False
-                    })
-                
-                # 添加课程学习相关配置
-                if '_cl' in model_config['physics']:
-                    model_def.update({
-                        'use_curriculum': True,
-                        'curriculum_learning': True,
-                        'warmup_steps': 5,
-                        'ramp_up_steps': 10
-                    })
-                
-                generated_models[model_name] = model_def
-                print(f"✅ 生成模型配置: {model_name}")
+            # 仅保留不含物理约束的模型
+            physics = model_config.get('physics', 'none')
+            if physics != 'none':
+                print(f"⏭️  跳过含物理约束的配置: {model_config['type']}_{physics}")
+                continue
+
+            # 基于 KAN 基函数命名（支持 bspline）
+            kan_basis = model_config.get('kan_basis')
+            if model_config['type'] in ['kan', 'kan_bspline'] and kan_basis == 'bspline':
+                model_name = 'kan_bspline'
+            else:
+                model_name = f"{model_config['type']}_none"
+
+            # 生成模型配置
+            model_def = {
+                'model_type': model_config['type'],
+                'physics_type': 'none',
+                'lambda_physics': 0.0,
+                'delay_model_dir': model_name,
+                'use_kan': model_config['type'] in ['kan', 'kan_bspline'],
+            }
+
+            # 透传 KAN 基函数配置（如果有）
+            if kan_basis:
+                model_def['kan_basis'] = kan_basis
+            if 'kan_grid_size' in model_config:
+                model_def['kan_grid_size'] = model_config.get('kan_grid_size')
+            if 'kan_spline_order' in model_config:
+                model_def['kan_spline_order'] = model_config.get('kan_spline_order')
+
+            generated_models[model_name] = model_def
+            print(f"✅ 生成模型配置: {model_name}")
         
         # 更新配置
         config['models'] = generated_models
@@ -172,19 +165,14 @@ class ExperimentRunner:
             ])
             if model_config['use_kan']:
                 cmd.append("--kan")
-                
-        elif experiment_type == "gradient":
-            cmd.extend([
-                "--model_dir", full_model_path,
-                "--output_dir", output_dir,
-                "--target", "delay",
-                "--traffic_min", str(global_settings['traffic_min']),
-                "--traffic_max", str(global_settings['traffic_max']),
-                "--num_points", str(global_settings['num_points'])
-            ])
-            if model_config['use_kan']:
-                cmd.append("--use_kan")
-                
+                # 透传 KAN 基函数配置
+                if model_config.get('kan_basis') == 'bspline':
+                    cmd.extend(["--kan_basis", "bspline"])
+                    if model_config.get('kan_grid_size') is not None:
+                        cmd.extend(["--kan_grid_size", str(model_config['kan_grid_size'])])
+                    if model_config.get('kan_spline_order') is not None:
+                        cmd.extend(["--kan_spline_order", str(model_config['kan_spline_order'])])
+
         elif experiment_type == "numerical":
             cmd.extend([
                 "--model_dir", full_model_path,
@@ -196,6 +184,12 @@ class ExperimentRunner:
             ])
             if model_config['use_kan']:
                 cmd.append("--kan")
+                if model_config.get('kan_basis') == 'bspline':
+                    cmd.extend(["--kan_basis", "bspline"])
+                    if model_config.get('kan_grid_size') is not None:
+                        cmd.extend(["--kan_grid_size", str(model_config['kan_grid_size'])])
+                    if model_config.get('kan_spline_order') is not None:
+                        cmd.extend(["--kan_spline_order", str(model_config['kan_spline_order'])])
         
         return cmd, output_dir
     
