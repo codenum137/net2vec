@@ -169,10 +169,10 @@ class ModelTrainer:
                 universal_newlines=True
             )
             
-            # 监控输出：控制台显示epoch进度，日志文件保存详细输出
-            output_lines = []
+            # 监控输出：控制台显示epoch进度，日志文件仅记录每个 epoch 一条信息
             current_epoch = 0
             total_epochs = self.epochs
+            logged_epochs = set()
             
             # 打开日志文件
             with open(log_file, 'w', encoding='utf-8') as log_f:
@@ -189,12 +189,6 @@ class ModelTrainer:
                     if output == '' and process.poll() is not None:
                         break
                     if output:
-                        output_lines.append(output)
-                        
-                        # 写入日志文件（实时）
-                        log_f.write(output)
-                        log_f.flush()
-                        
                         # 检查是否包含epoch信息
                         line_lower = output.lower().strip()
                         if 'epoch' in line_lower:
@@ -221,9 +215,11 @@ class ModelTrainer:
                                 progress_msg = f"📈 训练进度: Epoch {current_epoch}/{total_epochs} ({progress:.1f}%)"
                                 print(progress_msg)
                                 
-                                # 同时写入日志文件
-                                log_f.write(f"\n[PROGRESS] {progress_msg}\n")
-                                log_f.flush()
+                                # 日志中仅保留每个 epoch 一条信息
+                                if current_epoch not in logged_epochs:
+                                    log_f.write(f"[EPOCH] {progress_msg}\n")
+                                    log_f.flush()
+                                    logged_epochs.add(current_epoch)
                 
                 # 写入日志尾部信息
                 log_f.write(f"\n{'='*80}\n")
@@ -244,8 +240,6 @@ class ModelTrainer:
                     log_f.write(f"训练耗时: {duration:.1f}秒 ({duration/60:.1f}分钟)\n")
                     log_f.write(f"{'='*80}\n")
             
-            full_output = ''.join(output_lines)
-            
             if process.returncode == 0:
                 print(f"{'='*60}")
                 print(f"✅ 训练成功完成!")
@@ -258,7 +252,7 @@ class ModelTrainer:
                     log_f.write(f"返回码: {process.returncode}\n")
                 
                 # 保存训练结果
-                self._save_training_result(config, True, duration, full_output, "")
+                self._save_training_result(config, True, duration, "")
                 return True
             else:
                 print(f"{'='*60}")
@@ -272,7 +266,7 @@ class ModelTrainer:
                     log_f.write(f"返回码: {process.returncode}\n")
                 
                 # 保存训练结果
-                self._save_training_result(config, False, duration, full_output, f"Process returned {process.returncode}")
+                self._save_training_result(config, False, duration, f"Process returned {process.returncode}")
                 return False
                 
         except KeyboardInterrupt:
@@ -293,7 +287,7 @@ class ModelTrainer:
             except:
                 pass
             
-            self._save_training_result(config, False, duration, "", "用户中断")
+            self._save_training_result(config, False, duration, "用户中断")
             return False
         except Exception as e:
             print(f"{'='*60}")
@@ -310,10 +304,10 @@ class ModelTrainer:
             except:
                 pass
             
-            self._save_training_result(config, False, duration, "", str(e))
+            self._save_training_result(config, False, duration, str(e))
             return False
     
-    def _save_training_result(self, config, success, duration, stdout, stderr):
+    def _save_training_result(self, config, success, duration, stderr):
         """保存训练结果"""
         result = {
             "config": config["name"],
@@ -325,7 +319,6 @@ class ModelTrainer:
             "success": success,
             "duration": duration,
             "timestamp": datetime.now().isoformat(),
-            "stdout": stdout,
             "stderr": stderr
         }
         
