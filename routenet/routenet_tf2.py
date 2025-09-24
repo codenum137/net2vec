@@ -1408,13 +1408,13 @@ if __name__ == '__main__':
     # Plateau调度参数
     parser.add_argument('--plateau_factor', type=float, default=0.5,
                       help='Factor to reduce learning rate on plateau (only for plateau schedule)')
-    parser.add_argument('--plateau_patience', type=int, default=3,
+    parser.add_argument('--plateau_patience', type=int, default=8,
                       help='Number of epochs to wait before reducing LR on plateau (only for plateau schedule)')
     
     # 早停参数
     parser.add_argument('--early_stopping', action='store_true',
                       help='Enable early stopping based on validation loss')
-    parser.add_argument('--early_stopping_patience', type=int, default=5,
+    parser.add_argument('--early_stopping_patience', type=int, default=8,
                       help='Number of epochs to wait before early stopping (default: 5)')
     parser.add_argument('--early_stopping_min_delta', type=float, default=1e-6,
                       help='Minimum change in monitored quantity to qualify as an improvement (default: 1e-6)')
