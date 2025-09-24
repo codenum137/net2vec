@@ -13,14 +13,56 @@ import argparse
 import os
 from tqdm import tqdm
 import seaborn as sns
+import importlib
+import re
 
-# 导入训练脚本中的相关函数和类
-import sys
-sys.path.append(os.path.dirname(__file__))
-from routenet_tf2 import (
-    RouteNet, create_dataset,
-    scale_fn, heteroscedastic_loss, binomial_loss, create_model_and_loss_fn,
-)
+# 为不同 TF 版本选择后端模块（routenet_tf2 或 routenet_tf2_9）
+# 在 main 中根据 --tf-compat 参数与 TF 版本检测装配以下全局符号：
+# RouteNet, create_dataset, scale_fn, heteroscedastic_loss, binomial_loss, create_model_and_loss_fn
+RouteNet = None
+create_dataset = None
+scale_fn = None
+heteroscedastic_loss = None
+binomial_loss = None
+create_model_and_loss_fn = None
+
+def _select_backend_module(tf_version: str, override: str) -> str:
+    """根据 TF 版本或覆盖参数选择后端模块名。"""
+    # 处理覆盖
+    if override == 'tf2':
+        return 'routenet_tf2'
+    if override == 'tf2_9':
+        return 'routenet_tf2_9'
+    # 自动判断
+    if not tf_version:
+        return 'routenet_tf2'
+    m = re.match(r'^(\d+)\.(\d+)', tf_version)
+    if not m:
+        return 'routenet_tf2'
+    major = int(m.group(1))
+    minor = int(m.group(2))
+    if major < 2:
+        return 'routenet_tf2_9'
+    if major == 2 and minor <= 9:
+        return 'routenet_tf2_9'
+    return 'routenet_tf2'
+
+def _wire_backend(tf_compat: str):
+    """根据选择装配全局符号。"""
+    global RouteNet, create_dataset, scale_fn, heteroscedastic_loss, binomial_loss, create_model_and_loss_fn
+    # 允许从同目录导入
+    import sys as _sys
+    _sys.path.append(os.path.dirname(__file__))
+    tf_ver = getattr(tf, '__version__', None)
+    module_name = _select_backend_module(tf_ver, tf_compat)
+    mod = importlib.import_module(module_name)
+    RouteNet = getattr(mod, 'RouteNet')
+    create_dataset = getattr(mod, 'create_dataset')
+    scale_fn = getattr(mod, 'scale_fn')
+    heteroscedastic_loss = getattr(mod, 'heteroscedastic_loss')
+    binomial_loss = getattr(mod, 'binomial_loss')
+    create_model_and_loss_fn = getattr(mod, 'create_model_and_loss_fn')
+    print(f"🔧 TF version: {tf_ver}; evaluate backend: {module_name}")
 
 def load_model(model_dir, target, config, use_kan=False):
     """
@@ -329,8 +371,14 @@ def main():
                       help='Number of intervals for B-spline grid (only for bspline basis)')
     parser.add_argument('--kan_spline_order', type=int, default=None,
                       help='Degree/order of B-spline basis (only for bspline basis)')
+    # TF 版本兼容
+    parser.add_argument('--tf-compat', choices=['auto', 'tf2', 'tf2_9'], default='auto',
+                      help='Select evaluation backend by TF version: auto (default), tf2, tf2_9')
     
     args = parser.parse_args()
+
+    # 按版本装配后端（重要：在使用 RouteNet/create_dataset 前调用）
+    _wire_backend(args.tf_compat)
     
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)

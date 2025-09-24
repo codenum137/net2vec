@@ -212,10 +212,12 @@ class ModelTrainer:
                 universal_newlines=True
             )
             
-            # 监控输出：控制台显示epoch进度，日志文件仅记录每个 epoch 一条信息
+            # 监控输出：控制台显示epoch进度，日志文件每个 epoch 一条信息；错误信息完整保留
             current_epoch = 0
             total_epochs = self.epochs
             logged_epochs = set()
+            error_lines = []
+            in_traceback = False
             
             # 打开日志文件
             with open(log_file, 'w', encoding='utf-8') as log_f:
@@ -232,8 +234,25 @@ class ModelTrainer:
                     if output == '' and process.poll() is not None:
                         break
                     if output:
+                        # 低噪打印：仅保留 epoch 摘要 和 错误/异常 核心信息
+                        line_stripped = output.rstrip('\n')
+                        line_lower = line_stripped.lower().strip()
+
+                        # 捕获错误/异常/Traceback（写入日志与控制台）
+                        if 'traceback' in line_lower:
+                            in_traceback = True
+                        if in_traceback or any(kw in line_lower for kw in ['error', 'exception', 'failed']):
+                            # 写入日志
+                            log_f.write(line_stripped + '\n')
+                            log_f.flush()
+                            # 同步打印到控制台（保留原样）
+                            print(line_stripped)
+                            # 收集到错误缓冲
+                            error_lines.append(line_stripped)
+                            # 不再处理为 epoch 行
+                            continue
+                        
                         # 检查是否包含epoch信息
-                        line_lower = output.lower().strip()
                         if 'epoch' in line_lower:
                             # 尝试提取epoch数字 - 支持多种格式
                             import re
@@ -307,9 +326,13 @@ class ModelTrainer:
                 with open(log_file, 'a', encoding='utf-8') as log_f:
                     log_f.write(f"\n[ERROR] 训练失败!\n")
                     log_f.write(f"返回码: {process.returncode}\n")
+                    if error_lines:
+                        log_f.write("[ERROR LOG]\n")
+                        log_f.write("\n".join(error_lines) + "\n")
                 
                 # 保存训练结果
-                self._save_training_result(config, False, duration, f"Process returned {process.returncode}")
+                stderr_payload = ("\n".join(error_lines) + "\n") if error_lines else f"Process returned {process.returncode}"
+                self._save_training_result(config, False, duration, stderr_payload)
                 return False
                 
         except KeyboardInterrupt:

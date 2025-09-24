@@ -440,15 +440,21 @@ class RouteNet(tf.keras.Model):
             ids = tf.stack([paths, seqs], axis=1)
             # 为 TF 2.9 兼容，确保 max_len 为 int32
             max_len = tf.cast(tf.reduce_max(seqs) + 1, tf.int32)
-            shape = tf.stack([inputs['n_paths'], max_len, self.config['link_state_dim']])
+            # 形状张量需统一 dtype，使用 int64 以匹配 inputs['n_paths']
+            shape = tf.stack([
+                inputs['n_paths'],
+                tf.cast(max_len, tf.int64),
+                tf.cast(self.config['link_state_dim'], tf.int64)
+            ])
             
             # 计算每条路径的长度
             # 注意：segment_sum 要求 segment_ids 是排序的
             unique_paths, _ = tf.unique(paths)
             lens = tf.math.unsorted_segment_sum(
                 data=tf.ones_like(paths, dtype=tf.int32),
-                segment_ids=paths, 
-                num_segments=inputs['n_paths']
+                segment_ids=paths,
+                # TF 2.9 兼容：num_segments 使用 int32
+                num_segments=tf.cast(inputs['n_paths'], tf.int32)
             )
             
             # 将链路状态散布到序列格式 [n_paths, max_len, link_state_dim]
