@@ -347,8 +347,14 @@ class RouteNet(tf.keras.Model):
                     spline_order=config.get('kan_spline_order', 3),
                     basis_type=config.get('kan_basis', 'poly')
                 ))
-                if i < config['readout_layers'] - 1:  # 不在最后一层添加dropout
-                    readout_layers.append(tf.keras.layers.Dropout(0.1))
+                # 仅在中间层添加 Dropout，且需开启 use_dropout
+                if (
+                    i < config['readout_layers'] - 1
+                    and config.get('use_dropout', True)
+                ):
+                    readout_layers.append(
+                        tf.keras.layers.Dropout(config.get('dropout_rate', 0.1))
+                    )
             self.readout = tf.keras.Sequential(readout_layers)
         else:
             # 传统 MLP 读出网络
@@ -359,7 +365,10 @@ class RouteNet(tf.keras.Model):
                     activation='selu',
                     kernel_regularizer=tf.keras.regularizers.l2(config['l2'])
                 ))
-                readout_layers.append(tf.keras.layers.Dropout(0.1))
+                if config.get('use_dropout', True):
+                    readout_layers.append(
+                        tf.keras.layers.Dropout(config.get('dropout_rate', 0.1))
+                    )
             self.readout = tf.keras.Sequential(readout_layers)
         
         # 最终输出层，支持不同的激活函数
@@ -552,6 +561,9 @@ def main(args):
         'kan_basis': 'poly',        # 'poly' 或 'bspline'
         'kan_grid_size': 5,         # B样条间隔数，只有在bspline时使用
         'kan_spline_order': 3,      # B样条阶次（degree），典型为3
+        # Dropout 默认开启，率为 0.1
+        'use_dropout': True,
+        'dropout_rate': 0.1,
     }
 
     # 设置 TensorBoard 日志目录，包含target和KAN信息
@@ -581,6 +593,12 @@ def main(args):
         config['kan_grid_size'] = args.kan_grid_size
     if args.kan_spline_order is not None:
         config['kan_spline_order'] = args.kan_spline_order
+
+    # 覆盖 Dropout 配置
+    if args.no_dropout:
+        config['use_dropout'] = False
+    if args.dropout_rate is not None:
+        config['dropout_rate'] = float(args.dropout_rate)
 
     model, loss_fn = create_model_and_loss_fn(config, args.target, use_kan=args.kan)
     
@@ -824,6 +842,11 @@ if __name__ == '__main__':
                       help='Initial learning rate for Adam optimizer')
     parser.add_argument('--lr_schedule', type=str, choices=['fixed', 'exponential', 'cosine', 'polynomial', 'plateau'], 
                       default='fixed', help='Learning rate schedule strategy')
+    # Dropout 开关与比例
+    parser.add_argument('--no_dropout', action='store_true',
+                      help='Disable dropout layers in readout (default: enabled)')
+    parser.add_argument('--dropout_rate', type=float, default=0.1,
+                      help='Dropout rate when enabled (default: 0.1)')
     
     # 指数衰减参数
     parser.add_argument('--decay_steps', type=int, default=1000,

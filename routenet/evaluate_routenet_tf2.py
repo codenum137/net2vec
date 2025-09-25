@@ -104,7 +104,6 @@ def load_model(model_dir, target, config, use_kan=False):
     if weight_path is None:
         raise FileNotFoundError("No model weights found in {}".format(model_dir))
     
-    # 简化：仅使用标准模型创建方式（MLP 或 KAN，包括 B-spline）
     model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
     model_type = "KAN" if use_kan else "MLP"
     kb = config.get('kan_basis', 'poly') if use_kan else None

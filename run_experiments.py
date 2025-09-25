@@ -375,8 +375,8 @@ def main():
     parser.add_argument('--config', default='experiment_config.yaml', help='配置文件路径')
     parser.add_argument('--models', nargs='+', help='指定要运行的模型 (默认全部)')
     parser.add_argument('--experiments', nargs='+', 
-                       choices=['evaluate', 'gradient', 'numerical'],
-                       help='指定要运行的实验类型 (默认全部)')
+                       choices=['evaluate', 'numerical'],
+                       help='指定要运行的实验类型 (默认全部，仅 evaluate 与 numerical)')
     parser.add_argument('--parallel', action='store_true', help='并行运行实验')
     parser.add_argument('--max_workers', type=int, default=4, help='最大并行工作进程数')
     parser.add_argument('--validate_only', action='store_true', help='仅验证配置，不运行实验')

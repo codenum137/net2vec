@@ -16,7 +16,7 @@ import argparse
 import re
 
 class ModelTrainer:
-    def __init__(self, base_dir="./", force_retrain=False, enable_early_stopping=True, epochs=40, early_stopping_patience=8, tf_compat='auto'):
+    def __init__(self, base_dir="./", force_retrain=False, enable_early_stopping=True, epochs=40, early_stopping_patience=8, tf_compat='auto', use_dropout=True, dropout_rate=0.1):
         self.base_dir = Path(base_dir)
         self.train_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "train"
         self.eval_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "evaluate"
@@ -26,6 +26,8 @@ class ModelTrainer:
         self.epochs = epochs  # 训练轮数
         self.early_stopping_patience = early_stopping_patience  # 早停耐心值
         self.tf_compat = tf_compat  # 'auto' | 'tf2' | 'tf2_9'
+        self.use_dropout = use_dropout
+        self.dropout_rate = dropout_rate
 
         # 自动检测 TensorFlow 版本并选择对应训练脚本
         self.tf_version = self._detect_tf_version()
@@ -139,6 +141,13 @@ class ModelTrainer:
                         cmd.extend(["--kan_grid_size", str(config["kan_grid_size"])])
                     if "kan_spline_order" in config:
                         cmd.extend(["--kan_spline_order", str(config["kan_spline_order"])])
+        # Dropout 开关与比例（仅 routenet_tf2.py 支持；tf2_9 版本暂不透传）
+        script_name = os.path.basename(str(self.train_script))
+        if script_name == 'routenet_tf2.py':
+            if not self.use_dropout:
+                cmd.append("--no_dropout")
+            if self.dropout_rate is not None:
+                cmd.extend(["--dropout_rate", str(self.dropout_rate)])
         
         # 添加早停机制参数
         if self.enable_early_stopping:
@@ -491,6 +500,9 @@ def main():
     parser.add_argument("--early-stopping-patience", type=int, default=8, help="早停耐心值 (默认: 8)")
     # TF 版本兼容选择
     parser.add_argument("--tf-compat", choices=['auto', 'tf2', 'tf2_9'], default='auto', help="训练脚本选择：auto 根据TF版本自动选择；tf2 使用 routenet_tf2.py；tf2_9 使用 routenet_tf2_9.py")
+    # Dropout 控制
+    parser.add_argument("--no-dropout", dest="use_dropout", action="store_false", help="禁用读出层的dropout（默认启用）")
+    parser.add_argument("--dropout-rate", dest="dropout_rate", type=float, default=0.1, help="读出层dropout比例 (默认 0.1)")
     
     args = parser.parse_args()
     
@@ -509,6 +521,8 @@ def main():
         enable_early_stopping=not args.no_early_stopping,
         early_stopping_patience=args.early_stopping_patience,
         tf_compat=args.tf_compat,
+        use_dropout=args.use_dropout,
+        dropout_rate=args.dropout_rate,
     )
     
     if args.list:
