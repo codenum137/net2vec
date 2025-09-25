@@ -325,6 +325,10 @@ class RouteNet(tf.keras.Model):
         super().__init__()
         self.config = config
         self.use_kan = use_kan
+        # SAE 设置（仅在 MLP 模式下启用；如果传入KAN且要求SAE，直接忽略并提示）
+        self.sae_enabled = bool(config.get('sae_enabled', False)) and (not use_kan)
+        if bool(config.get('sae_enabled', False)) and use_kan:
+            tf.print("[SAE] KAN 模式下忽略 SAE（当前仅支持 MLP+SAE）")
         
         # 消息传递层（与原版保持一致的命名）
         self.link_update = tf.keras.layers.GRUCell(config['link_state_dim'])  # 原版中叫 edge_update
@@ -378,7 +382,21 @@ class RouteNet(tf.keras.Model):
             kernel_regularizer=tf.keras.regularizers.l2(config['l2_2'])
         )
 
-    def call(self, inputs, training=False):
+        # 构建稀疏自编码器 (SAE) - 仅当启用且为 MLP
+        if self.sae_enabled:
+            sae_hidden = int(config.get('sae_hidden_dim', 64))
+            sae_latent = int(config.get('sae_latent_dim', 16))
+            sae_act = config.get('sae_activation', 'relu')
+            self.sae_encoder = tf.keras.Sequential([
+                tf.keras.layers.Dense(sae_hidden, activation=sae_act, name='sae_enc_hidden'),
+                tf.keras.layers.Dense(sae_latent, activation=sae_act, name='sae_enc_latent')
+            ], name='sae_encoder')
+            self.sae_decoder = tf.keras.Sequential([
+                tf.keras.layers.Dense(sae_hidden, activation=sae_act, name='sae_dec_hidden'),
+                tf.keras.layers.Dense(config['link_state_dim'], activation=None, name='sae_dec_out')
+            ], name='sae_decoder')
+
+    def call(self, inputs, training=False, return_aux=False):
         # 初始化状态
         link_state = tf.concat([
             tf.expand_dims(inputs['capacities'], axis=1),
@@ -441,7 +459,18 @@ class RouteNet(tf.keras.Model):
         # 读出阶段
         readout_output = self.readout(path_state, training=training)
         final_input = tf.concat([readout_output, path_state], axis=1)
-        return self.final_layer(final_input)
+        pred = self.final_layer(final_input)
+
+        if self.sae_enabled:
+            # SAE 使用最终的 link_state 作为重构目标
+            original = link_state  # [n_links, link_state_dim]
+            latent = self.sae_encoder(original, training=training)  # [n_links, latent]
+            recon = self.sae_decoder(latent, training=training)     # [n_links, link_state_dim]
+            if return_aux:
+                return pred, { 'original_link_state': original, 'recon': recon, 'latent': latent }
+        if return_aux:
+            return pred, None
+        return pred
 
 
 # ==============================================================================
@@ -450,33 +479,49 @@ class RouteNet(tf.keras.Model):
 
 # 已移除梯度约束损失
 
-def heteroscedastic_loss(y_true, y_pred):
-    """异方差损失函数 - 用于延迟预测
-    
-    这个实现与原始routenet.py中的实现保持一致：
-    - 使用相同的scale计算方式（包含c偏移常数）
-    - 使用相同的_2sigma计算方式
+def make_delay_loss(config):
+    """创建延迟预测损失函数（支持 legacy 与 standard 两种形式）。
+
+    不再在 loss_fn 上维护跨图属性，所有诊断指标由 train_step / eval_step 内部计算后返回。
     """
-    loc = y_pred[:, 0]
-    
-    # 与原版保持一致的scale计算，包含重要的c偏移常数
-    c = tf.math.log(tf.math.expm1(tf.constant(0.098, dtype=tf.float32)))
-    scale = tf.nn.softplus(c + y_pred[:, 1]) + 1e-9
-    
-    delay_true = y_true['delay']
-    jitter_true = y_true['jitter']
-    packets_true = y_true['packets'] 
-    drops_true = y_true['drops']
-    
-    n = packets_true - drops_true
-    # 与原版保持一致的_2sigma计算
-    _2sigma = tf.constant(2.0, dtype=tf.float32) * tf.square(scale)
-    
-    nll = (n * jitter_true / _2sigma + 
-           n * tf.square(delay_true - loc) / _2sigma + 
-           n * tf.math.log(scale))
-           
-    return tf.reduce_sum(nll) / 1e6
+    variant = config.get('loss_variant', 'standard')
+
+    def legacy_loss(y_true, y_pred):
+        loc = y_pred[:, 0]
+        c = tf.math.log(tf.math.expm1(tf.constant(0.098, dtype=tf.float32)))
+        scale = tf.nn.softplus(c + y_pred[:, 1]) + 1e-9
+        delay_true = y_true['delay']
+        jitter_true = y_true['jitter']
+        packets_true = y_true['packets']
+        drops_true = y_true['drops']
+        n = packets_true - drops_true
+        _2sigma = tf.constant(2.0, dtype=tf.float32) * tf.square(scale)
+        nll = (n * jitter_true / _2sigma + n * tf.square(delay_true - loc) / _2sigma + n * tf.math.log(scale))
+        loss = tf.reduce_sum(nll) / 1e6
+        return loss
+
+    def standard_loss(y_true, y_pred):
+        loc = y_pred[:, 0]
+        raw_scale = y_pred[:, 1]
+        sigma = tf.nn.softplus(raw_scale) + 1e-6  # 保证 >0
+        delay_true = y_true['delay']
+        packets_true = y_true['packets']
+        drops_true = y_true['drops']
+        n = packets_true - drops_true
+        res = delay_true - loc
+        nll = 0.5 * (tf.square(res) / tf.square(sigma) + 2.0 * tf.math.log(sigma) + tf.math.log(2.0 * tf.constant(3.141592653589793, dtype=tf.float32)))
+        weighted = n * nll
+        loss = tf.reduce_sum(weighted) / (tf.reduce_sum(n) + 1e-9)
+        return loss
+
+    def loss_fn(y_true, y_pred):
+        if variant == 'legacy':
+            return legacy_loss(y_true, y_pred)
+        else:
+            return standard_loss(y_true, y_pred)
+
+    loss_fn.variant = variant
+    return loss_fn
 
 def binomial_loss(y_true, y_pred):
     """二项分布损失函数 - 用于丢包预测
@@ -512,8 +557,8 @@ def create_model_and_loss_fn(config, target, use_kan=False):
 
     if target == 'delay':
         model = RouteNet(config, output_units=2, final_activation=None, use_kan=use_kan)
-        loss_fn = heteroscedastic_loss
-        print("Created {} delay prediction model with standard heteroscedastic loss".format(model_type))
+        loss_fn = make_delay_loss(config)
+        print("Created {} delay prediction model with {} loss variant".format(model_type, loss_fn.variant))
     elif target == 'drops':
         model = RouteNet(config, output_units=1, final_activation=None, use_kan=use_kan)
         loss_fn = binomial_loss
@@ -523,26 +568,76 @@ def create_model_and_loss_fn(config, target, use_kan=False):
 
     return model, loss_fn
 
-@tf.function
-def train_step(model, optimizer, features, labels, loss_fn):
-    """标准训练步骤（无物理/梯度约束）。"""
+@tf.function(experimental_relax_shapes=True)
+def train_step(model, optimizer, features, labels, loss_fn, sae_alpha=1.0, sae_beta=1e-4):
+    """标准训练步骤 + 可选SAE联合训练。
+
+    返回:
+      total_loss, metrics_dict, predictions
+    metrics_dict: {'delay_loss':..., 'recon_loss':..., 'sparsity_loss':...}
+    """
     with tf.GradientTape() as tape:
-        predictions = model(features, training=True)
-        loss = loss_fn(labels, predictions)
-        # 添加模型正则化损失
-        loss += sum(model.losses)
+        outputs = model(features, training=True, return_aux=model.sae_enabled)
+        if model.sae_enabled:
+            predictions, aux = outputs
+        else:
+            predictions = outputs
+            aux = None
+        delay_loss = loss_fn(labels, predictions)
+        recon_loss = tf.constant(0.0, dtype=tf.float32)
+        sparsity_loss = tf.constant(0.0, dtype=tf.float32)
+        if model.sae_enabled and aux is not None:
+            recon_loss = tf.reduce_mean(tf.square(aux['recon'] - aux['original_link_state']))
+            sparsity_loss = tf.reduce_mean(tf.abs(aux['latent']))
+        total_loss = delay_loss + sae_alpha * recon_loss + sae_beta * sparsity_loss
+        total_loss += tf.add_n(model.losses) if model.losses else 0.0
 
-    gradients = tape.gradient(loss, model.trainable_variables)
+    gradients = tape.gradient(total_loss, model.trainable_variables)
     optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+    # 诊断指标（在图内计算并返回）
+    loc = predictions[:, 0]
+    raw_scale = predictions[:, 1]
+    if loss_fn.variant == 'legacy':
+        c = tf.math.log(tf.math.expm1(tf.constant(0.098, dtype=tf.float32)))
+        scale = tf.nn.softplus(c + raw_scale) + 1e-9
+    else:
+        scale = tf.nn.softplus(raw_scale) + 1e-6
+    delay_true = labels['delay']
+    res = delay_true - loc
+    rmse = tf.sqrt(tf.reduce_mean(tf.square(res)))
+    mean_scale = tf.reduce_mean(scale)
+    ratio = rmse / (mean_scale + 1e-9)
+    return total_loss, delay_loss, recon_loss, sparsity_loss, mean_scale, rmse, ratio, predictions
 
-    return loss, predictions
-
-@tf.function  
-def eval_step(model, features, labels, loss_fn):
-    predictions = model(features, training=False)
-    loss = loss_fn(labels, predictions)
-    loss += sum(model.losses)
-    return loss, predictions
+@tf.function(experimental_relax_shapes=True)
+def eval_step(model, features, labels, loss_fn, sae_alpha=1.0, sae_beta=1e-4):
+    outputs = model(features, training=False, return_aux=model.sae_enabled)
+    if model.sae_enabled:
+        predictions, aux = outputs
+    else:
+        predictions = outputs
+        aux = None
+    delay_loss = loss_fn(labels, predictions)
+    recon_loss = tf.constant(0.0, dtype=tf.float32)
+    sparsity_loss = tf.constant(0.0, dtype=tf.float32)
+    if model.sae_enabled and aux is not None:
+        recon_loss = tf.reduce_mean(tf.square(aux['recon'] - aux['original_link_state']))
+        sparsity_loss = tf.reduce_mean(tf.abs(aux['latent']))
+    total_loss = delay_loss + sae_alpha * recon_loss + sae_beta * sparsity_loss
+    total_loss += tf.add_n(model.losses) if model.losses else 0.0
+    loc = predictions[:, 0]
+    raw_scale = predictions[:, 1]
+    if loss_fn.variant == 'legacy':
+        c = tf.math.log(tf.math.expm1(tf.constant(0.098, dtype=tf.float32)))
+        scale = tf.nn.softplus(c + raw_scale) + 1e-9
+    else:
+        scale = tf.nn.softplus(raw_scale) + 1e-6
+    delay_true = labels['delay']
+    res = delay_true - loc
+    rmse = tf.sqrt(tf.reduce_mean(tf.square(res)))
+    mean_scale = tf.reduce_mean(scale)
+    ratio = rmse / (mean_scale + 1e-9)
+    return total_loss, delay_loss, recon_loss, sparsity_loss, mean_scale, rmse, ratio, predictions
 
 # ==============================================================================
 # 4. 主执行逻辑
@@ -564,6 +659,13 @@ def main(args):
         # Dropout 默认开启，率为 0.1
         'use_dropout': True,
         'dropout_rate': 0.1,
+        # SAE 默认关闭
+        'sae_enabled': False,
+        'sae_hidden_dim': 64,
+        'sae_latent_dim': 16,
+        'sae_alpha': 1.0,
+        'sae_beta': 1e-4,
+        'sae_activation': 'relu',
     }
 
     # 设置 TensorBoard 日志目录，包含target和KAN信息
@@ -599,6 +701,24 @@ def main(args):
         config['use_dropout'] = False
     if args.dropout_rate is not None:
         config['dropout_rate'] = float(args.dropout_rate)
+
+    # 覆盖 SAE 配置（仅 MLP 生效）
+    if args.enable_sae:
+        config['sae_enabled'] = True
+    if args.sae_hidden_dim is not None:
+        config['sae_hidden_dim'] = args.sae_hidden_dim
+    if args.sae_latent_dim is not None:
+        config['sae_latent_dim'] = args.sae_latent_dim
+    if args.sae_alpha is not None:
+        config['sae_alpha'] = args.sae_alpha
+    if args.sae_beta is not None:
+        config['sae_beta'] = args.sae_beta
+    if args.sae_activation is not None:
+        config['sae_activation'] = args.sae_activation
+
+    # 记录异方差延迟损失变体
+    config['loss_variant'] = args.loss_variant if hasattr(args, 'loss_variant') else 'standard'
+    print(f"[LOSS] Using heteroscedastic delay loss variant: {config['loss_variant']}")
 
     model, loss_fn = create_model_and_loss_fn(config, args.target, use_kan=args.kan)
     
@@ -674,56 +794,93 @@ def main(args):
         pbar = tqdm(train_dataset, desc="Training Epoch {}".format(epoch+1))
         
         for features, labels in pbar:
-            # 标准训练步骤
-            loss, predictions = train_step(model, optimizer, features, labels, loss_fn)
-            
-            total_train_loss += loss
-            
+            total_loss_t, delay_loss_t, recon_loss_t, sparsity_loss_t, mean_scale_t, rmse_t, ratio_t, _ = train_step(
+                model, optimizer, features, labels, loss_fn,
+                sae_alpha=tf.constant(config['sae_alpha'], dtype=tf.float32),
+                sae_beta=tf.constant(config['sae_beta'], dtype=tf.float32)
+            )
+            total_train_loss += total_loss_t
             train_step_count += 1
             global_step += 1
-            
-            # 记录每个批次的损失到 TensorBoard (每10步记录一次)
             if global_step % 10 == 0:
                 with train_summary_writer.as_default():
-                    tf.summary.scalar('batch_loss', loss, step=global_step)
-                    # 记录当前学习率
+                    tf.summary.scalar('batch_total_loss', total_loss_t, step=global_step)
+                    tf.summary.scalar('batch_delay_loss', delay_loss_t, step=global_step)
+                    if model.sae_enabled:
+                        tf.summary.scalar('batch_recon_loss', recon_loss_t, step=global_step)
+                        tf.summary.scalar('batch_sparsity_loss', sparsity_loss_t, step=global_step)
+                    tf.summary.scalar('delay_mean_scale', mean_scale_t, step=global_step)
+                    tf.summary.scalar('delay_rmse', rmse_t, step=global_step)
+                    tf.summary.scalar('delay_rmse_over_mean_sigma', ratio_t, step=global_step)
                     current_lr = optimizer.learning_rate
                     if hasattr(current_lr, 'numpy'):
                         current_lr = current_lr.numpy()
                     tf.summary.scalar('learning_rate', current_lr, step=global_step)
-            
-            # 更新进度条显示
-            pbar.set_postfix({'loss': '{:.4f}'.format(loss), 'step': global_step})
+            pbar.set_postfix({'total': '{:.4f}'.format(float(total_loss_t.numpy())), 'delay': '{:.4f}'.format(float(delay_loss_t.numpy()))})
                 
         avg_train_loss = total_train_loss / train_step_count
 
         # 记录训练的平均损失
         with train_summary_writer.as_default():
-            tf.summary.scalar('epoch_loss', avg_train_loss, step=epoch + 1)
+            tf.summary.scalar('epoch_total_loss', avg_train_loss, step=epoch + 1)
 
         # 评估
         total_eval_loss = 0.0
         eval_step_count = 0
         pbar_eval = tqdm(eval_dataset, desc="Evaluating Epoch {}".format(epoch+1))
         
+        last_mean_scale = last_rmse = last_ratio = None
         for features, labels in pbar_eval:
-            # 评估步骤
-            loss, predictions = eval_step(model, features, labels, loss_fn)
-            
-            total_eval_loss += loss
+            total_loss_t, delay_loss_t, recon_loss_t, sparsity_loss_t, mean_scale_t, rmse_t, ratio_t, _ = eval_step(
+                model, features, labels, loss_fn,
+                sae_alpha=tf.constant(config['sae_alpha'], dtype=tf.float32),
+                sae_beta=tf.constant(config['sae_beta'], dtype=tf.float32)
+            )
+            total_eval_loss += total_loss_t
             eval_step_count += 1
-            pbar_eval.set_postfix({'loss': '{:.4f}'.format(loss)})
+            pbar_eval.set_postfix({'total': '{:.4f}'.format(float(total_loss_t.numpy())), 'delay':'{:.4f}'.format(float(delay_loss_t.numpy()))})
+            last_mean_scale = mean_scale_t
+            last_rmse = rmse_t
+            last_ratio = ratio_t
             
         avg_eval_loss = total_eval_loss / eval_step_count
 
         # 记录验证损失
         with val_summary_writer.as_default():
-            tf.summary.scalar('epoch_loss', avg_eval_loss, step=epoch + 1)
-            # 记录每个epoch结束时的学习率
+            tf.summary.scalar('epoch_total_loss', avg_eval_loss, step=epoch + 1)
             current_lr = optimizer.learning_rate
             if hasattr(current_lr, 'numpy'):
                 current_lr = current_lr.numpy()
             tf.summary.scalar('learning_rate_epoch', current_lr, step=epoch + 1)
+            # 记录最终一批的延迟模型诊断指标
+            if last_mean_scale is not None:
+                tf.summary.scalar('epoch_delay_mean_scale', last_mean_scale, step=epoch + 1)
+                tf.summary.scalar('epoch_delay_rmse', last_rmse, step=epoch + 1)
+                tf.summary.scalar('epoch_delay_rmse_over_mean_sigma', last_ratio, step=epoch + 1)
+
+        # ================= SAE 统计探针（可选） =================
+        if model.sae_enabled and args.sae_probe_batches > 0:
+            probe_latents = []
+            taken = 0
+            for f_probe, l_probe in eval_dataset:
+                preds_aux = model(f_probe, training=False, return_aux=True)
+                _, aux_probe = preds_aux
+                if aux_probe is not None:
+                    probe_latents.append(aux_probe['latent'])
+                taken += 1
+                if taken >= args.sae_probe_batches:
+                    break
+            if probe_latents:
+                lat = tf.concat(probe_latents, axis=0)
+                abs_lat = tf.abs(lat)
+                threshold = tf.constant(args.sae_sparsity_threshold, dtype=lat.dtype)
+                sparsity_ratio = tf.reduce_mean(tf.cast(abs_lat < threshold, tf.float32))
+                mean_abs = tf.reduce_mean(abs_lat)
+                with val_summary_writer.as_default():
+                    tf.summary.scalar('sae_sparsity_ratio', sparsity_ratio, step=epoch + 1)
+                    tf.summary.scalar('sae_latent_mean_abs', mean_abs, step=epoch + 1)
+                    tf.summary.histogram('sae_latent', lat, step=epoch + 1)
+                print(f"[SAE] epoch {epoch+1}: sparsity_ratio={sparsity_ratio:.4f} (|z|<{args.sae_sparsity_threshold}), mean|z|={mean_abs:.4e}")
 
         # 如果使用ReduceLROnPlateau，手动调整学习率
         if reduce_lr_callback is not None:
@@ -746,8 +903,8 @@ def main(args):
                             reduce_lr_callback.wait = 0
 
         # 输出epoch结果
-        print("Epoch {} finished. Avg Train Loss: {:.4f}, Avg Eval Loss: {:.4f}, LR: {:.6f}".format(
-            epoch + 1, avg_train_loss, avg_eval_loss, 
+        print("Epoch {} finished. Avg Train Total Loss: {:.4f}, Avg Eval Total Loss: {:.4f}, LR: {:.6f}".format(
+            epoch + 1, avg_train_loss, avg_eval_loss,
             optimizer.learning_rate.numpy() if hasattr(optimizer.learning_rate, 'numpy') else optimizer.learning_rate))
 
         # 保存最佳模型
@@ -847,6 +1004,16 @@ if __name__ == '__main__':
                       help='Disable dropout layers in readout (default: enabled)')
     parser.add_argument('--dropout_rate', type=float, default=0.1,
                       help='Dropout rate when enabled (default: 0.1)')
+    # SAE 联合训练配置（仅 MLP 模式有效）
+    parser.add_argument('--enable_sae', action='store_true', help='Enable joint training with Sparse Autoencoder (only MLP)')
+    parser.add_argument('--sae_hidden_dim', type=int, default=64, help='Hidden dimension of SAE encoder/decoder')
+    parser.add_argument('--sae_latent_dim', type=int, default=16, help='Latent dimension of SAE')
+    parser.add_argument('--sae_alpha', type=float, default=1.0, help='Weight α for SAE reconstruction loss')
+    parser.add_argument('--sae_beta', type=float, default=1e-4, help='Weight β for SAE sparsity (L1 on latent)')
+    parser.add_argument('--sae_activation', type=str, default='relu', choices=['relu','selu','tanh','gelu'], help='Activation for SAE layers')
+    parser.add_argument('--sae_sparsity_threshold', type=float, default=1e-3, help='Threshold for counting a latent unit as inactive')
+    parser.add_argument('--sae_probe_batches', type=int, default=1, help='Number of eval batches to probe SAE latent each epoch (0 to disable)')
+    parser.add_argument('--loss_variant', type=str, choices=['standard','legacy'], default='standard', help='Heteroscedastic delay loss variant: standard (Gaussian NLL) or legacy (original)')
     
     # 指数衰减参数
     parser.add_argument('--decay_steps', type=int, default=1000,
