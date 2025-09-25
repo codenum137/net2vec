@@ -12,6 +12,20 @@ global_settings:
 
   # 实验参数
   batch_size: 32
+
+  # ================= 新增：评估与数值实验的独立控制 =================
+  # 对 evaluate_routenet_tf2.py 执行完整测试集评估：
+  # true -> 不传递 --num_samples，脚本内部遍历全部样本
+  # false -> 使用下面的 num_samples_evaluate（若未设置则回退到 num_samples）
+  evaluate_full: true
+
+  # （可选）只在 evaluate_full: false 时生效；如果想指定评估采样数量可填写，例如 1500
+  # num_samples_evaluate: 1500
+
+  # numerical 分析使用的采样数量（必要；覆盖通用 num_samples）
+  num_samples_numerical: 2000
+
+  # （回退值）如果上面两个专用键缺失，会使用此通用值；保留兼容性
   num_samples: 2000
 
   # 输出根目录

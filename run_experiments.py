@@ -155,14 +155,48 @@ class ExperimentRunner:
         
         # 构建参数
         if experiment_type == "evaluate":
+            # 允许对 evaluate 进行完整测试集评估：
+            # 策略：
+            # 1) 如果 global_settings 中存在 evaluate_full=True -> 不传递 --num_samples
+            # 2) 如果存在 num_samples_evaluate -> 使用它；为 None 或 'all' 时视为完整评估
+            # 3) 否则回退到 num_samples（保持兼容），但仍可通过设置 evaluate_full 控制跳过
+            eval_full = global_settings.get('evaluate_full', False)
+            eval_num_samples = global_settings.get('num_samples_evaluate', None)
+            base_num_samples = global_settings.get('num_samples', None)
+
             cmd.extend([
                 "--delay_model_dir", full_model_path,
                 "--nsfnet_test_dir", global_settings['nsfnet_test_dir'],
                 "--gbn_test_dir", global_settings['gbn_test_dir'],
                 "--output_dir", output_dir,
-                "--batch_size", str(global_settings['batch_size']),
-                "--num_samples", str(global_settings['num_samples'])
+                "--batch_size", str(global_settings['batch_size'])
             ])
+
+            # 判定是否需要附加 --num_samples
+            use_num_samples_flag = True
+            selected_num_samples = None
+
+            if eval_full:
+                use_num_samples_flag = False
+            else:
+                if eval_num_samples is not None:
+                    # 支持字符串'all' 或 None 代表完整
+                    if isinstance(eval_num_samples, str) and eval_num_samples.lower() == 'all':
+                        use_num_samples_flag = False
+                    else:
+                        selected_num_samples = eval_num_samples
+                else:
+                    # 没有专门的 evaluate 数量，使用通用 num_samples（如果提供）
+                    if base_num_samples is not None:
+                        selected_num_samples = base_num_samples
+                    else:
+                        # 均未提供 -> 不限制
+                        use_num_samples_flag = False
+
+            if use_num_samples_flag and selected_num_samples is not None:
+                cmd.extend(["--num_samples", str(selected_num_samples)])
+            elif not use_num_samples_flag:
+                print(f"ℹ️  evaluate: 跳过 --num_samples，执行完整测试集评估 (model={model_name})")
             if model_config['use_kan']:
                 cmd.append("--kan")
                 # 透传 KAN 基函数配置
@@ -174,13 +208,23 @@ class ExperimentRunner:
                         cmd.extend(["--kan_spline_order", str(model_config['kan_spline_order'])])
 
         elif experiment_type == "numerical":
+            # numerical 仍然需要 num_samples，允许通过 num_samples_numerical 覆盖
+            num_samples_numerical = global_settings.get('num_samples_numerical', None)
+            base_num_samples = global_settings.get('num_samples', None)
+            if num_samples_numerical is not None:
+                numerical_samples = num_samples_numerical
+            elif base_num_samples is not None:
+                numerical_samples = base_num_samples
+            else:
+                raise ValueError("numerical 实验需要 num_samples 或 num_samples_numerical (未在 global_settings 中找到)")
+
             cmd.extend([
                 "--model_dir", full_model_path,
                 "--nsfnet_test_dir", global_settings['nsfnet_test_dir'],
                 "--gbn_test_dir", global_settings['gbn_test_dir'],
                 "--output_dir", output_dir,
                 "--batch_size", str(global_settings['batch_size']),
-                "--num_samples", str(global_settings['num_samples'])
+                "--num_samples", str(numerical_samples)
             ])
             if model_config['use_kan']:
                 cmd.append("--kan")
