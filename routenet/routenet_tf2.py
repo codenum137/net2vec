@@ -682,16 +682,9 @@ def main(args):
     
     optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
     
-    # 如果使用plateau调度，创建ReduceLROnPlateau callback
-    reduce_lr_callback = None
-    if args.lr_schedule == 'plateau':
-        reduce_lr_callback = tf.keras.callbacks.ReduceLROnPlateau(
-            monitor='val_loss',
-            factor=args.plateau_factor,
-            patience=args.plateau_patience,
-            min_lr=args.learning_rate * 0.001,
-            verbose=1
-        )
+    # Plateau 调度自定义实现（避免使用回调对象导致 best=None 比较出错）
+    plateau_best = None
+    plateau_wait = 0
     
     print("Starting training for target: {}".format(args.target))
     print("TensorBoard logs will be saved to: {}".format(log_dir))
@@ -772,25 +765,21 @@ def main(args):
         with train_summary_writer.as_default():
             tf.summary.scalar('val_epoch_loss', avg_eval_loss, step=epoch + 1)
 
-        # 如果使用ReduceLROnPlateau，手动调整学习率
-        if reduce_lr_callback is not None:
-            # 模拟callback行为
-            if not hasattr(reduce_lr_callback, 'best'):
-                reduce_lr_callback.best = avg_eval_loss
-                reduce_lr_callback.wait = 0
+        # Plateau 学习率调度逻辑
+        if args.lr_schedule == 'plateau':
+            cur_val = float(avg_eval_loss.numpy() if hasattr(avg_eval_loss, 'numpy') else avg_eval_loss)
+            if plateau_best is None or cur_val < plateau_best - 0.0:  # 不额外使用 min_delta，这里简单判断
+                plateau_best = cur_val
+                plateau_wait = 0
             else:
-                if avg_eval_loss < reduce_lr_callback.best:
-                    reduce_lr_callback.best = avg_eval_loss
-                    reduce_lr_callback.wait = 0
-                else:
-                    reduce_lr_callback.wait += 1
-                    if reduce_lr_callback.wait >= args.plateau_patience:
-                        old_lr = optimizer.learning_rate.numpy()
-                        new_lr = old_lr * args.plateau_factor
-                        if new_lr >= args.learning_rate * 0.001:
-                            optimizer.learning_rate.assign(new_lr)
-                            print("Reducing learning rate from {:.6f} to {:.6f}".format(old_lr, new_lr))
-                            reduce_lr_callback.wait = 0
+                plateau_wait += 1
+                if plateau_wait >= args.plateau_patience:
+                    old_lr = optimizer.learning_rate.numpy() if hasattr(optimizer.learning_rate, 'numpy') else float(optimizer.learning_rate)
+                    new_lr = max(old_lr * args.plateau_factor, args.learning_rate * 0.001)
+                    if new_lr < old_lr:
+                        optimizer.learning_rate.assign(new_lr)
+                        print("[Plateau] Reducing learning rate from {:.6f} to {:.6f}".format(old_lr, new_lr))
+                    plateau_wait = 0
 
         # 输出epoch结果
         print("Epoch {} finished. Avg Train Loss: {:.4f}, Avg Eval Loss: {:.4f}, LR: {:.6f}".format(
