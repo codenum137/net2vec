@@ -1,0 +1,78 @@
+# 实验配置文件（精简版）
+# 仅包含非物理约束模型：MLP、KAN-Poly、KAN-Bspline
+
+# 全局设置
+global_settings:
+  # 数据路径
+  nsfnet_test_dir: "data/routenet/nsfnetbw/tfrecords/evaluate"
+  gbn_test_dir: "data/routenet/gbnbw/tfrecords/evaluate"
+  
+  # 模型目录基础路径
+  models_base_dir: "fixed_model/old"
+  
+  # 实验参数
+  batch_size: 32
+  # num_samples: 1000
+  
+  # 梯度验证参数
+  traffic_min: 0.1
+  traffic_max: 1.0
+  num_points: 20
+  
+  # 输出根目录
+  base_output_dir: "experiment_results/0925-opt"
+
+# 模型配置方案（由运行器自动生成 models）
+model_configs:
+  - type: "mlp"
+    physics: "none"
+    enabled: true
+
+  - type: "kan"
+    physics: "none"
+    enabled: true  # KAN-Poly
+
+  - type: "kan_bspline"
+    physics: "none"
+    enabled: true  # KAN-Bspline
+    kan_basis: "bspline"
+    kan_grid_size: 5
+    kan_spline_order: 3
+
+# 实验定义
+experiments:
+  evaluate:
+    script: "routenet/evaluate_routenet_tf2.py"
+    required_args:
+      - "delay_model_dir"
+      - "nsfnet_test_dir"
+      - "gbn_test_dir"
+      - "output_dir"
+    optional_args:
+      - "batch_size"
+      - "num_samples"
+      - "kan"
+      
+  # gradient:
+  #   script: "routenet/gradient_sanity_check.py"
+  #   required_args:
+  #     - "model_dir"
+  #     - "output_dir"
+  #   optional_args:
+  #     - "use_kan"
+  #     - "target"
+  #     - "traffic_min"
+  #     - "traffic_max"
+  #     - "num_points"
+      
+  # numerical:
+  #   script: "routenet/numerical_analysis.py"
+  #   required_args:
+  #     - "model_dir"
+  #     - "nsfnet_test_dir"
+  #     - "gbn_test_dir"
+  #     - "output_dir"
+  #   optional_args:
+  #     - "batch_size"
+  #     - "num_samples"
+  #     - "kan"
