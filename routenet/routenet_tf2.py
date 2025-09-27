@@ -765,9 +765,9 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='RouteNet TF2 Implementation')
-    parser.add_argument('--train_dir', type=str, required=True, 
+    parser.add_argument('--train_dir', type=str,default='./data/routenet/nsfnetbw/tfrecords/train', 
                       help='Directory containing training TFRecord files')
-    parser.add_argument('--eval_dir', type=str, required=True,
+    parser.add_argument('--eval_dir', type=str, default='./data/routenet/nsfnetbw/tfrecords/evaluate',
                       help='Directory containing evaluation TFRecord files') 
     parser.add_argument('--model_dir', type=str, required=True,
                       help='Directory to save model checkpoints and logs')
