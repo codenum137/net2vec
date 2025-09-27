@@ -5,6 +5,8 @@ import argparse
 import os
 from tqdm import tqdm
 import datetime
+import random
+
 
 # ==============================================================================
 # 1. 数据加载与预处理 (无变化)
@@ -110,10 +112,11 @@ def transformation_func(features_batch, labels_batch):
     
     return merged_features, merged_labels
 
-def create_dataset(filenames, batch_size, is_training=True):
+def create_dataset(filenames, batch_size, is_training=True, seed=None):
     ds = tf.data.TFRecordDataset(filenames)
     if is_training:
-        ds = ds.shuffle(1000)
+        # 使用提供的 seed 以实现可复现性
+        ds = ds.shuffle(1000, seed=seed, reshuffle_each_iteration=True)
     
     ds = ds.map(parse_fn, num_parallel_calls=tf.data.AUTOTUNE)
     
@@ -425,7 +428,29 @@ def eval_step(model, features, labels, loss_fn, sae_alpha=1.0, sae_beta=1e-4):
 # 4. 主执行逻辑
 # ==============================================================================
 
+def set_global_determinism(seed: int):
+    """设置全局随机种子与确定性选项以最大化复现性。
+
+    注意：某些 GPU 算子仍可能存在非确定性实现；如果需要完全确定性，
+    可在必要时切换到 CPU 或升级 / 固定特定 TF 与 CUDA 版本。
+    """
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'  # 触发部分算子的确定性实现
+    os.environ['TF_CUDNN_DETERMINISTIC'] = '1'
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+    # 新版本 TF (>=2.13) 支持的 API，若不存在则忽略
+    try:
+        tf.config.experimental.enable_op_determinism()
+    except Exception:  # pragma: no cover - 兼容旧版本
+        pass
+
+
 def main(args):
+    # 在执行任何需要随机性的逻辑之前设置随机种子
+    set_global_determinism(args.seed)
+    print(f"[SEED] Global seed set to {args.seed} (PYTHON/NumPy/TF). Deterministic ops requested.")
     config = {
         'link_state_dim': 4,
         'path_state_dim': 2,
@@ -457,11 +482,11 @@ def main(args):
     val_summary_writer = tf.summary.create_file_writer(val_log_dir)
 
     train_files = tf.io.gfile.glob(os.path.join(args.train_dir, '*.tfrecords'))
-    train_dataset = create_dataset(train_files, args.batch_size, is_training=True)
+    train_dataset = create_dataset(train_files, args.batch_size, is_training=True, seed=args.seed)
     print("Found {} training files.".format(len(train_files)))
 
     eval_files = tf.io.gfile.glob(os.path.join(args.eval_dir, '*.tfrecords'))
-    eval_dataset = create_dataset(eval_files, args.batch_size, is_training=False)
+    eval_dataset = create_dataset(eval_files, args.batch_size, is_training=False, seed=args.seed)
     print("Found {} evaluation files.".format(len(eval_files)))
 
     # 覆盖 Dropout 配置
@@ -798,6 +823,8 @@ if __name__ == '__main__':
     # 用于cosine和polynomial调度的steps_per_epoch估计
     parser.add_argument('--steps_per_epoch', type=int, default=100,
                       help='Estimated steps per epoch for cosine/polynomial schedules')
+    # 复现性
+    parser.add_argument('--seed', type=int, default=137, help='Global random seed for Python/NumPy/TensorFlow')
     
     args = parser.parse_args()
     
