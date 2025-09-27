@@ -110,4 +110,4 @@ experiment_results/
 fixed_model/
 training_logs/
 evaluation_results/
-
+sample_efficiency_results/
