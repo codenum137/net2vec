@@ -13,8 +13,6 @@ import argparse
 import os
 from tqdm import tqdm
 import seaborn as sns
-import json
-import numpy as np
 
 # 导入训练脚本中的相关函数和类
 import sys
@@ -65,16 +63,41 @@ def load_model(model_dir, target, config, use_kan=False):
     if weight_path is None:
         raise FileNotFoundError("No model weights found in {}".format(model_dir))
     
+    # 尝试使用新的PhysicsInformedRouteNet加载，如果失败则使用旧的方式
+    try:
+        # 先尝试新的模型结构 (PhysicsInformedRouteNet)
+        model = PhysicsInformedRouteNet(
+            config=config,
+            target=target,
+            use_kan=use_kan,
+            use_physics_loss=False,  # 评估时不需要物理约束
+            use_hard_constraint=False,
+            lambda_physics=0.0,
+            use_curriculum=False
+        )
+        if use_kan:
+            kb = config.get('kan_basis', 'poly')
+            if kb == 'bspline':
+                print(f"Using PhysicsInformedRouteNet (KAN bspline) for {target} evaluation")
+            else:
+                print(f"Using PhysicsInformedRouteNet (KAN poly) for {target} evaluation")
+        else:
+            print(f"Using PhysicsInformedRouteNet (MLP) for {target} evaluation")
+        return model, weight_path
+        
+    except Exception as e:
+        print(f"Failed to create PhysicsInformedRouteNet: {e}, falling back to original model")
+        # 回退到旧的模型创建方式
+        from routenet_tf2 import create_model_and_loss_fn
+        
+        # 使用旧的模型创建方式
     model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
+    print(f"Using legacy model for {target} evaluation")
+    return model, weight_path
+    
     model_type = "KAN" if use_kan else "MLP"
-    kb = config.get('kan_basis', 'poly') if use_kan else None
-    if use_kan and kb == 'bspline':
-        print(f"Using KAN (bspline) for {target} evaluation")
-    elif use_kan:
-        print(f"Using KAN (poly) for {target} evaluation")
-    else:
-        print(f"Using MLP for {target} evaluation")
     print("Loading {} {} model weights from: {}".format(model_type, target, weight_path))
+    
     return model, weight_path
 
 def evaluate_delay_jitter_model(model, dataset, num_samples=None):
@@ -98,7 +121,11 @@ def evaluate_delay_jitter_model(model, dataset, num_samples=None):
     
     for features, labels in tqdm(dataset, desc="Evaluating delay/jitter model"):
         # 模型预测 - 异方差输出：[loc, scale]
-        pred = model(features, training=False)
+        # 根据模型类型选择正确的调用方式
+        if isinstance(model, PhysicsInformedRouteNet):
+            pred = model.routenet(features, training=False)
+        else:
+            pred = model(features, training=False)
         
         pred_delay = pred[:, 0].numpy()  # 延迟预测均值 (loc)
         
@@ -160,7 +187,11 @@ def evaluate_drops_model(model, dataset, num_samples=None):
     
     for features, labels in tqdm(dataset, desc="Evaluating drops model"):
         # 模型预测 - 输出 logits
-        pred_logits = model(features, training=False)
+        # 根据模型类型选择正确的调用方式
+        if isinstance(model, PhysicsInformedRouteNet):
+            pred_logits = model.routenet(features, training=False)
+        else:
+            pred_logits = model(features, training=False)
         pred_probs = tf.nn.sigmoid(pred_logits[:, 0]).numpy()
         
         # 收集真实值
@@ -312,10 +343,10 @@ def main():
     parser = argparse.ArgumentParser(description='Comprehensive RouteNet Evaluation')
     parser.add_argument('--delay_model_dir', type=str, required=True,
                       help='Directory containing delay prediction model')
-    parser.add_argument('--nsfnet_test_dir', type=str, default='data/routenet/nsfnetbw/tfrecords/evaluate',
-                      help='Directory containing NSFNet test data (default: data/routenet/nsfnetbw/tfrecords/evaluate)')
-    parser.add_argument('--gbn_test_dir', type=str, default='data/routenet/gbnbw/tfrecords/evaluate',
-                      help='Directory containing GBN test data (default: data/routenet/gbnbw/tfrecords/evaluate)')
+    parser.add_argument('--nsfnet_test_dir', type=str, required=True,
+                      help='Directory containing NSFNet test data')
+    parser.add_argument('--gbn_test_dir', type=str, required=True,
+                      help='Directory containing GBN test data')
     parser.add_argument('--output_dir', type=str, required=True,
                       help='Directory to save evaluation results')
     parser.add_argument('--batch_size', type=int, default=32,
@@ -324,46 +355,18 @@ def main():
                       help='Limit number of samples to evaluate')
     parser.add_argument('--kan', action='store_true',
                       help='Evaluate KAN-based models instead of traditional MLP models')
-    # 缓存相关参数
-    parser.add_argument('--cache_file', type=str, default=None, help='Path to save/load cached evaluation (npz). Default: output_dir/eval_cache_{mlp|kan}.npz')
-    parser.add_argument('--use_cache', action='store_true', help='If set and cache file exists, skip model inference and reuse cached results')
+    # KAN basis options (optional; only used when --kan is set)
+    parser.add_argument('--kan_basis', type=str, choices=['poly', 'bspline'], default=None,
+                      help='KAN basis type for readout: poly (default) or bspline')
+    parser.add_argument('--kan_grid_size', type=int, default=None,
+                      help='Number of intervals for B-spline grid (only for bspline basis)')
+    parser.add_argument('--kan_spline_order', type=int, default=None,
+                      help='Degree/order of B-spline basis (only for bspline basis)')
     
     args = parser.parse_args()
-
-    # 按版本装配后端（重要：在使用 RouteNet/create_dataset 前调用）
-    _wire_backend(args.tf_compat)
     
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
-
-    model_suffix = "_kan" if args.kan else "_mlp"
-    # 解析缓存文件名
-    cache_path = args.cache_file if args.cache_file else os.path.join(args.output_dir, f"eval_cache{model_suffix}.npz")
-    print(f"Cache file path: {cache_path}")
-
-    # 如果使用缓存且文件存在 -> 直接加载并绘图
-    if args.use_cache and os.path.isfile(cache_path):
-        print("\n🔄 Using cached evaluation results, skipping model loading & inference...")
-        data = np.load(cache_path, allow_pickle=True)
-        nsfnet_errors = {}
-        gbn_errors = {}
-        # 只收集误差数组（命名为 nsfnet_delay / nsfnet_jitter / gbn_delay / gbn_jitter）
-        for metric_name in ['delay','jitter']:
-            ndk = f"nsfnet_{metric_name}"
-            gdk = f"gbn_{metric_name}"
-            if ndk in data.files:
-                nsfnet_errors[metric_name] = data[ndk]
-            if gdk in data.files:
-                gbn_errors[metric_name] = data[gdk]
-        # 原始预测/真值可用性提示
-        has_raw = any(k.startswith('nsfnet_pred_') or k.startswith('gbn_pred_') for k in data.files)
-        if has_raw:
-            print("✅ Raw prediction & ground-truth arrays present in cache (keys: nsfnet_pred_*, nsfnet_gt_* , gbn_pred_*, gbn_gt_*).")
-        print_evaluation_summary(nsfnet_errors, gbn_errors)
-        print("\nGenerating linear focus CDF plot from cache...")
-        plot_linear_focus_cdf(nsfnet_errors, gbn_errors, args.output_dir, model_suffix)
-        print("Done (from cache).")
-        return
     
     # 模型配置（与训练时保持一致）
     config = {
@@ -422,15 +425,41 @@ def main():
     # 初始化模型权重（需要先运行一次前向传播）
     print("\nInitializing models...")
     
-    # 进行一次前向传播以构建模型
-    for dataset in [nsfnet_dataset.take(1)]:
-        for features, labels in dataset:
-            _ = delay_model(features, training=False)
-            break
+    # 检查模型类型并相应处理
+    if isinstance(delay_model, PhysicsInformedRouteNet):
+        # 对于PhysicsInformedRouteNet，需要先进行完整的前向传播来构建模型
+        for dataset in [nsfnet_dataset.take(1)]:
+            for features, labels in dataset:
+                # 使用完整的调用路径来确保模型被正确构建
+                _ = delay_model(features, training=False)
+                break
+    else:
+        # 对于传统模型
+        for dataset in [nsfnet_dataset.take(1)]:
+            for features, labels in dataset:
+                _ = delay_model(features, training=False)
+                break
     
     # 加载权重
-    delay_model.load_weights(delay_weight_path)
-    print("Model loaded successfully!")
+    try:
+        delay_model.load_weights(delay_weight_path)
+        print("Models loaded successfully!")
+    except Exception as e:
+        print(f"Failed to load weights: {e}")
+        # 尝试加载到子模型
+        if isinstance(delay_model, PhysicsInformedRouteNet):
+            try:
+                delay_model.routenet.load_weights(delay_weight_path)
+                print("Weights loaded to routenet submodel successfully!")
+            except Exception as e2:
+                print(f"Failed to load weights to routenet submodel: {e2}")
+                # 最后尝试：手动构建模型结构
+                print("Attempting manual model building...")
+                delay_model.routenet.build(input_shape=[(None, None, None), (None, None)])
+                delay_model.routenet.load_weights(delay_weight_path)
+                print("Weights loaded after manual building!")
+        else:
+            raise e
     
     # 评估NSFNet（同拓扑）
     print("\n" + "="*50)
@@ -438,7 +467,7 @@ def main():
     print("="*50)
     
     # 评估delay和jitter
-    nsfnet_preds, nsfnet_gts, nsfnet_delay_jitter_errors = evaluate_delay_jitter_model(
+    _, _, nsfnet_delay_jitter_errors = evaluate_delay_jitter_model(
         delay_model, nsfnet_dataset, args.num_samples
     )
     nsfnet_errors = nsfnet_delay_jitter_errors
@@ -449,7 +478,7 @@ def main():
     print("="*50)
     
     # 评估delay和jitter
-    gbn_preds, gbn_gts, gbn_delay_jitter_errors = evaluate_delay_jitter_model(
+    _, _, gbn_delay_jitter_errors = evaluate_delay_jitter_model(
         delay_model, gbn_dataset, args.num_samples
     )
     gbn_errors = gbn_delay_jitter_errors
@@ -459,44 +488,8 @@ def main():
     
     # 绘制线性刻度CDF图（仅生成linear_focus版本）
     print("\nGenerating linear focus CDF plot...")
+    model_suffix = "_kan" if args.kan else "_mlp"
     plot_linear_focus_cdf(nsfnet_errors, gbn_errors, args.output_dir, model_suffix)
-
-    # ================= 保存缓存 =================
-    save_dict = {}
-    # 误差数组
-    for metric, arr in nsfnet_errors.items():
-        save_dict[f"nsfnet_{metric}"] = arr
-    for metric, arr in gbn_errors.items():
-        save_dict[f"gbn_{metric}"] = arr
-    # 原始预测与真值（delay / jitter）
-    for metric, arr in nsfnet_preds.items():
-        save_dict[f"nsfnet_pred_{metric}"] = arr
-    for metric, arr in nsfnet_gts.items():
-        save_dict[f"nsfnet_gt_{metric}"] = arr
-    for metric, arr in gbn_preds.items():
-        save_dict[f"gbn_pred_{metric}"] = arr
-    for metric, arr in gbn_gts.items():
-        save_dict[f"gbn_gt_{metric}"] = arr
-    np.savez_compressed(cache_path, **save_dict)
-    print(f"\n💾 Cached relative error arrays saved to: {cache_path}")
-
-    # 额外：输出一个 summary JSON 便于快速查看
-    summary = {}
-    def stats(a):
-        return {
-            'count': int(a.size),
-            'mean_abs': float(np.mean(np.abs(a))) if a.size else None,
-            'median_abs': float(np.median(np.abs(a))) if a.size else None,
-            'p90_abs': float(np.percentile(np.abs(a), 90)) if a.size else None,
-            'p95_abs': float(np.percentile(np.abs(a), 95)) if a.size else None,
-            'mean_signed': float(np.mean(a)) if a.size else None,
-        }
-    summary['nsfnet'] = {m: stats(v) for m,v in nsfnet_errors.items()}
-    summary['gbn'] = {m: stats(v) for m,v in gbn_errors.items()}
-    summary_path = os.path.join(args.output_dir, f"eval_summary{model_suffix}.json")
-    with open(summary_path, 'w', encoding='utf-8') as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
-    print(f"📄 Summary stats JSON saved to: {summary_path}")
     
     print("\nEvaluation completed! Results saved to: {}".format(args.output_dir))
 
