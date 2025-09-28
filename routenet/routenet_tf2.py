@@ -1213,6 +1213,21 @@ def main(args):
     
     best_eval_loss = float('inf')
     global_step = 0
+
+    # Helper to safely convert Tensor/NumPy scalars to Python float
+    def _to_float(x):
+        try:
+            import numpy as _np  # local import to avoid global dependency issues
+            if isinstance(x, (float, int)):
+                return float(x)
+            if hasattr(x, 'numpy'):
+                return float(x.numpy())
+            if isinstance(x, _np.ndarray) and x.shape == ():
+                return float(x.item())
+            return float(x)
+        except Exception:
+            # Fallback: do not raise inside training loop; return NaN to surface issue in logs
+            return float('nan')
     
     # 早停变量初始化
     if args.early_stopping:
@@ -1300,11 +1315,17 @@ def main(args):
                 })
             else:
                 pbar.set_postfix({'loss': '{:.4f}'.format(loss), 'step': global_step})
-                
+        
         avg_train_loss = total_train_loss / train_step_count
         avg_hetero_loss = total_hetero_loss / train_step_count 
         avg_gradient_loss = total_gradient_loss / train_step_count
         avg_lambda_physics = total_lambda_physics / train_step_count if total_lambda_physics > 0 else 0
+
+        # Ensure averages are Python floats (avoid Tensor <-> None comparisons later)
+        avg_train_loss = _to_float(avg_train_loss)
+        avg_hetero_loss = _to_float(avg_hetero_loss)
+        avg_gradient_loss = _to_float(avg_gradient_loss)
+        avg_lambda_physics = _to_float(avg_lambda_physics)
 
         # 记录训练的平均损失
         with train_summary_writer.as_default():
@@ -1333,8 +1354,9 @@ def main(args):
             total_eval_loss += loss
             eval_step_count += 1
             pbar_eval.set_postfix({'loss': '{:.4f}'.format(loss)})
-            
+        
         avg_eval_loss = total_eval_loss / eval_step_count
+        avg_eval_loss = _to_float(avg_eval_loss)
 
         # 记录验证损失
         with val_summary_writer.as_default():
@@ -1347,21 +1369,25 @@ def main(args):
 
         # 如果使用ReduceLROnPlateau，手动调整学习率
         if reduce_lr_callback is not None:
-            # 模拟callback行为
-            if not hasattr(reduce_lr_callback, 'best'):
-                reduce_lr_callback.best = avg_eval_loss
+            # Simulate ReduceLROnPlateau manually while ensuring we work with pure floats
+            current_loss = _to_float(avg_eval_loss)
+            if not hasattr(reduce_lr_callback, 'best') or reduce_lr_callback.best is None:
+                reduce_lr_callback.best = current_loss
                 reduce_lr_callback.wait = 0
             else:
-                if avg_eval_loss < reduce_lr_callback.best:
-                    reduce_lr_callback.best = avg_eval_loss
+                if current_loss < reduce_lr_callback.best:
+                    reduce_lr_callback.best = current_loss
                     reduce_lr_callback.wait = 0
                 else:
                     reduce_lr_callback.wait += 1
                     if reduce_lr_callback.wait >= args.plateau_patience:
-                        old_lr = optimizer.learning_rate.numpy()
+                        old_lr = optimizer.learning_rate.numpy() if hasattr(optimizer.learning_rate, 'numpy') else float(optimizer.learning_rate)
                         new_lr = old_lr * args.plateau_factor
                         if new_lr >= args.learning_rate * 0.001:
-                            optimizer.learning_rate.assign(new_lr)
+                            if hasattr(optimizer.learning_rate, 'assign'):
+                                optimizer.learning_rate.assign(new_lr)
+                            else:  # fallback if lr is plain float (unlikely with Adam)
+                                optimizer.learning_rate = new_lr
                             print("Reducing learning rate from {:.6f} to {:.6f}".format(old_lr, new_lr))
                             reduce_lr_callback.wait = 0
 
