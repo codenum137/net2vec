@@ -11,7 +11,8 @@ from datetime import datetime
 
 class ModelTrainer:
     def __init__(self, base_dir: str = './', force_retrain: bool = False,
-                 enable_early_stopping: bool = True, early_stopping_patience: int = 5):
+                 enable_early_stopping: bool = True, early_stopping_patience: int = 5,
+                 dropout_rates=None, lambda_list=None):
         self.base_dir = Path(base_dir)
         self.train_script = self.base_dir / 'routenet' / 'routenet_tf2.py'
         self.train_data_dir = self.base_dir / 'data' / 'routenet' / 'nsfnetbw' / 'tfrecords' / 'train'
@@ -20,6 +21,9 @@ class ModelTrainer:
         self.force_retrain = force_retrain
         self.enable_early_stopping = enable_early_stopping
         self.early_stopping_patience = early_stopping_patience
+        self.dropout_rates = dropout_rates if dropout_rates is not None else [0.1, 0.0]
+        self.lambda_list = lambda_list if lambda_list is not None else [0.05]
+        self.add_lambda_suffix = len(self.lambda_list) > 1
         self.training_configs = self._generate_training_configs()
 
     def _generate_training_configs(self):
@@ -40,22 +44,39 @@ class ModelTrainer:
             # {"type": "kan", "use_kan": True, "physics": "hard_cl", "use_physics_loss": True, "use_hard_constraint": True, "use_curriculum": True},
         ]
         for mc in model_configs:
-            cfg = {
-                'name': f"{mc['type']}_{mc['physics']}",
-                'model_type': mc['type'],
-                'use_kan': mc['use_kan'],
-                'physics_type': mc['physics'],
-                'use_physics_loss': mc['use_physics_loss'],
-                'use_hard_constraint': mc['use_hard_constraint'],
-                'lambda_physics': 0.05,
-                'use_curriculum': False,
-                'model_dir': self._get_model_dir(mc, None)
-            }
-            configs.append(cfg)
+            # 针对物理约束模型遍历 lambda; 非物理模型只产生一次 (lam=None)
+            lam_candidates = self.lambda_list if mc['use_physics_loss'] else [None]
+            for lam in lam_candidates:
+                for dropout_rate in self.dropout_rates:
+                    name_base = f"{mc['type']}_{mc['physics']}"
+                    if lam is not None and self.add_lambda_suffix:
+                        lam_str = ('{:.4g}'.format(lam)).replace('.', 'p')
+                        name_base += f"_l{lam_str}"
+                    if dropout_rate == 0.0:
+                        name_base += '_nodrop'
+                    cfg = {
+                        'name': name_base,
+                        'model_type': mc['type'],
+                        'use_kan': mc['use_kan'],
+                        'physics_type': mc['physics'],
+                        'use_physics_loss': mc['use_physics_loss'],
+                        'use_hard_constraint': mc['use_hard_constraint'],
+                        'lambda_physics': lam if lam is not None else 0.0,
+                        'use_curriculum': mc.get('use_curriculum', False),
+                        'dropout_rate': dropout_rate,
+                        'model_dir': self._get_model_dir(mc, lam, nodrop=(dropout_rate==0.0))
+                    }
+                    configs.append(cfg)
         return configs
 
-    def _get_model_dir(self, mc, lam):
-        return self.models_base_dir / f"{mc['type']}_{mc['physics']}"
+    def _get_model_dir(self, mc, lam, nodrop=False):
+        base = f"{mc['type']}_{mc['physics']}"
+        if mc['use_physics_loss'] and self.add_lambda_suffix and lam is not None:
+            lam_str = ('{:.4g}'.format(lam)).replace('.', 'p')
+            base += f"_l{lam_str}"
+        if nodrop:
+            base += '_nodrop'
+        return self.models_base_dir / base
 
     def _build_training_command(self, cfg):
         cmd = [
@@ -70,10 +91,18 @@ class ModelTrainer:
             '--learning_rate', '0.001',
             '--plateau_patience', '8',
             '--plateau_factor', '0.5',
-            '--seed', '137'
+            '--seed', '137',
+            '--dropout_rate', str(cfg.get('dropout_rate', 0.1))
         ]
         if cfg['use_kan']:
             cmd.append('--kan')
+        # 物理约束参数: soft -> physics_loss; hard -> physics_loss + hard_physics
+        if cfg['use_physics_loss']:
+            cmd.append('--physics_loss')
+            if cfg['use_hard_constraint']:
+                cmd.append('--hard_physics')
+            # 指定lambda
+            cmd.extend(['--lambda_physics', str(cfg['lambda_physics'])])
         if self.enable_early_stopping:
             cmd.extend([
                 '--early_stopping',
@@ -84,7 +113,10 @@ class ModelTrainer:
         return cmd
 
     def train_model(self, cfg, raw_output: bool = False):
-        print(f"\n{'='*70}\n🚀 模型: {cfg['name']}  (类型: {cfg['model_type'].upper()}  物理: {cfg['physics_type']})")
+        physics_info = cfg['physics_type']
+        if cfg['use_physics_loss']:
+            physics_info += f" λ={cfg['lambda_physics']}" + (" (hard)" if cfg['use_hard_constraint'] else " (soft)")
+        print(f"\n{'='*70}\n🚀 模型: {cfg['name']}  (类型: {cfg['model_type'].upper()}  物理: {physics_info}  dropout={cfg.get('dropout_rate',0.1)})")
         model_file = cfg['model_dir'] / ('best_delay_kan_model.weights.h5' if cfg['use_kan'] else 'best_delay_model.weights.h5')
         if model_file.exists() and not self.force_retrain:
             print(f"⏭️  已存在，跳过: {model_file}")
@@ -193,6 +225,15 @@ class ModelTrainer:
                 print()  # 结束最后一行的\r覆盖
             if p.returncode == 0:
                 print(f"✅ 完成: {cfg['name']}  用时 {dur/60:.1f} 分钟")
+                # 记录命令与运行时间到模型目录日志文件（仅需求字段）
+                try:
+                    log_file = cfg['model_dir'] / 'train_run.log'
+                    with open(log_file, 'a', encoding='utf-8') as lf:
+                        lf.write(
+                            f"{datetime.now().isoformat()}\tsecs={dur:.2f}\tcmd={' '.join(cmd)}\n"
+                        )
+                except Exception as log_e:
+                    print(f"⚠️ 写入日志失败: {log_e}")
                 return True
             else:
                 print(f"❌ 失败: {cfg['name']}  code={p.returncode}")
@@ -251,13 +292,17 @@ def main():
     parser.add_argument('--no-early-stopping', action='store_true', help='禁用早停')
     parser.add_argument('--early-stopping-patience', type=int, default=5, help='早停耐心')
     parser.add_argument('--raw-output', action='store_true', help='显示原始子进程输出(可能刷屏)')
+    parser.add_argument('--dropouts', nargs='+', type=float, default=[0.1, 0.0], help='遍历的dropout列表，例如: --dropouts 0 0.1')
+    parser.add_argument('--lambdas', nargs='+', type=float, default=[0.05], help='遍历的lambda_physics列表(仅物理约束模型)，例如: --lambdas 0.01 0.05')
     args = parser.parse_args()
 
     trainer = ModelTrainer(
         base_dir=args.base_dir,
         force_retrain=args.force,
         enable_early_stopping=not args.no_early_stopping,
-        early_stopping_patience=args.early_stopping_patience
+        early_stopping_patience=args.early_stopping_patience,
+        dropout_rates=args.dropouts,
+        lambda_list=args.lambdas
     )
 
     if args.list:

@@ -33,9 +33,12 @@ class ExperimentRunner:
         with open(self.config_file, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
         
-        # 如果配置文件包含 model_configs，自动生成 models
+        # 如果包含 model_configs 但已经显式提供 models，则不覆盖（保持与配置文件一致）
         if 'model_configs' in config:
-            config = self._generate_models_from_configs(config)
+            if 'models' not in config or not config.get('models'):
+                config = self._generate_models_from_configs(config)
+            else:
+                print("ℹ️ 检测到同时存在 model_configs 与 models，保持 models 原样，不进行自动生成")
         
         print(f"✅ 已加载配置文件: {self.config_file}")
         print(f"📋 发现 {len(config['models'])} 个模型配置")
@@ -48,38 +51,46 @@ class ExperimentRunner:
         print("🔧 检测到 model_configs，自动生成模型配置...")
         
         model_configs = config.get('model_configs', [])
-        
+        lambda_values = config.get('lambda_values', [0.0])
+        if len(lambda_values) > 1:
+            print("⚠️ 检测到多个 lambda_values，但当前命名模式不包含 lambda，可能导致重名。仅使用第一个值: {}".format(lambda_values[0]))
+        lambda_value = lambda_values[0] if lambda_values else 0.0
+
         generated_models = {}
-        
         for model_config in model_configs:
-            if not model_config.get('enabled', True):
-                # 兼容无 physics 字段的配置
-                physics = model_config.get('physics', 'none')
-                print(f"⏭️  跳过禁用的配置: {model_config['type']}_{physics}")
-                continue
-            # 仅保留不含物理约束的模型
+            model_type = model_config.get('type')
             physics = model_config.get('physics', 'none')
-            if physics != 'none':
-                print(f"⏭️  跳过含物理约束的配置: {model_config['type']}_{physics}")
+            enabled = model_config.get('enabled', True)
+            if not enabled:
+                print(f"⏭️  跳过禁用的配置: {model_type}_{physics}")
                 continue
 
-            # 基于 KAN 基函数命名（支持 bspline）
-            kan_basis = model_config.get('kan_basis')
-            if model_config['type'] in ['kan', 'kan_bspline'] and kan_basis == 'bspline':
-                model_name = 'kan_bspline'
+            # 目录命名：none -> {type}_none, 其余 -> {type}_{physics}
+            if physics == 'none':
+                model_name = f"{model_type}_none"
             else:
-                model_name = f"{model_config['type']}_none"
+                model_name = f"{model_type}_{physics}"
 
-            # 生成模型配置
+            # 基于 KAN 判定
+            use_kan = model_type.startswith('kan')
+            kan_basis = model_config.get('kan_basis')
+
             model_def = {
-                'model_type': model_config['type'],
-                'physics_type': 'none',
-                'lambda_physics': 0.0,
+                'model_type': model_type,
+                'physics_type': physics,
+                'lambda_physics': 0.0 if physics == 'none' else lambda_value,
                 'delay_model_dir': model_name,
-                'use_kan': model_config['type'] in ['kan', 'kan_bspline'],
+                'use_kan': use_kan,
             }
 
-            # 透传 KAN 基函数配置（如果有）
+            # 课程学习标志（physics 包含 _cl）
+            if physics.endswith('_cl'):
+                model_def['curriculum_learning'] = True
+                # 可选参数
+                model_def['warmup_steps'] = model_config.get('warmup_steps', 5)
+                model_def['ramp_up_steps'] = model_config.get('ramp_up_steps', 10)
+
+            # 透传 KAN 基函数配置
             if kan_basis:
                 model_def['kan_basis'] = kan_basis
             if 'kan_grid_size' in model_config:
@@ -88,12 +99,10 @@ class ExperimentRunner:
                 model_def['kan_spline_order'] = model_config.get('kan_spline_order')
 
             generated_models[model_name] = model_def
-            print(f"✅ 生成模型配置: {model_name}")
-        
-        # 更新配置
+            print(f"✅ 生成模型配置: {model_name} (physics={physics}, lambda={model_def['lambda_physics']})")
+
         config['models'] = generated_models
-        print(f"🎯 总共生成 {len(generated_models)} 个模型配置")
-        
+        print(f"🎯 总共生成 {len(generated_models)} 个模型配置 (命名不含 lambda 后缀)")
         return config
     
     def get_full_model_path(self, model_config):
@@ -138,103 +147,102 @@ class ExperimentRunner:
         """构建实验命令"""
         exp_config = self.config['experiments'][experiment_type]
         global_settings = self.config['global_settings']
-        
-        # 基础命令
+
         script_path = exp_config['script']
         cmd = ["python", script_path]
-        
-        # 输出目录
+
         output_dir = os.path.join(
             global_settings['base_output_dir'],
             model_name,
             experiment_type
         )
-        
-        # 获取完整模型路径
+
         full_model_path = self.get_full_model_path(model_config)
-        
-        # 构建参数
-        if experiment_type == "evaluate":
-            # 允许对 evaluate 进行完整测试集评估：
-            # 策略：
-            # 1) 如果 global_settings 中存在 evaluate_full=True -> 不传递 --num_samples
-            # 2) 如果存在 num_samples_evaluate -> 使用它；为 None 或 'all' 时视为完整评估
-            # 3) 否则回退到 num_samples（保持兼容），但仍可通过设置 evaluate_full 控制跳过
+
+        if experiment_type == 'evaluate':
             eval_full = global_settings.get('evaluate_full', False)
             eval_num_samples = global_settings.get('num_samples_evaluate', None)
             base_num_samples = global_settings.get('num_samples', None)
 
             cmd.extend([
-                "--delay_model_dir", full_model_path,
-                "--nsfnet_test_dir", global_settings['nsfnet_test_dir'],
-                "--gbn_test_dir", global_settings['gbn_test_dir'],
-                "--output_dir", output_dir,
-                "--batch_size", str(global_settings['batch_size'])
+                '--delay_model_dir', full_model_path,
+                '--nsfnet_test_dir', global_settings['nsfnet_test_dir'],
+                '--gbn_test_dir', global_settings['gbn_test_dir'],
+                '--output_dir', output_dir,
+                '--batch_size', str(global_settings['batch_size'])
             ])
 
-            # 判定是否需要附加 --num_samples
             use_num_samples_flag = True
             selected_num_samples = None
-
             if eval_full:
                 use_num_samples_flag = False
             else:
                 if eval_num_samples is not None:
-                    # 支持字符串'all' 或 None 代表完整
                     if isinstance(eval_num_samples, str) and eval_num_samples.lower() == 'all':
                         use_num_samples_flag = False
                     else:
                         selected_num_samples = eval_num_samples
                 else:
-                    # 没有专门的 evaluate 数量，使用通用 num_samples（如果提供）
                     if base_num_samples is not None:
                         selected_num_samples = base_num_samples
                     else:
-                        # 均未提供 -> 不限制
                         use_num_samples_flag = False
 
             if use_num_samples_flag and selected_num_samples is not None:
-                cmd.extend(["--num_samples", str(selected_num_samples)])
+                cmd.extend(['--num_samples', str(selected_num_samples)])
             elif not use_num_samples_flag:
-                print(f"ℹ️  evaluate: 跳过 --num_samples，执行完整测试集评估 (model={model_name})")
-            if model_config['use_kan']:
-                cmd.append("--kan")
-                # 透传 KAN 基函数配置
-                if model_config.get('kan_basis') == 'bspline':
-                    cmd.extend(["--kan_basis", "bspline"])
-                    if model_config.get('kan_grid_size') is not None:
-                        cmd.extend(["--kan_grid_size", str(model_config['kan_grid_size'])])
-                    if model_config.get('kan_spline_order') is not None:
-                        cmd.extend(["--kan_spline_order", str(model_config['kan_spline_order'])])
+                print(f"ℹ️ evaluate: 跳过 --num_samples，执行完整测试集评估 (model={model_name})")
 
-        elif experiment_type == "numerical":
-            # numerical 仍然需要 num_samples，允许通过 num_samples_numerical 覆盖
-            num_samples_numerical = global_settings.get('num_samples_numerical', None)
-            base_num_samples = global_settings.get('num_samples', None)
-            if num_samples_numerical is not None:
-                numerical_samples = num_samples_numerical
-            elif base_num_samples is not None:
-                numerical_samples = base_num_samples
-            else:
-                raise ValueError("numerical 实验需要 num_samples 或 num_samples_numerical (未在 global_settings 中找到)")
+            if model_config.get('use_kan'):
+                cmd.append('--kan')
+                if model_config.get('kan_basis') == 'bspline':
+                    cmd.extend(['--kan_basis', 'bspline'])
+                    if model_config.get('kan_grid_size') is not None:
+                        cmd.extend(['--kan_grid_size', str(model_config['kan_grid_size'])])
+                    if model_config.get('kan_spline_order') is not None:
+                        cmd.extend(['--kan_spline_order', str(model_config['kan_spline_order'])])
+
+        elif experiment_type == 'numerical':
+            num_samples_numerical = global_settings.get('num_samples_numerical')
+            base_num_samples = global_settings.get('num_samples')
+            numerical_samples = num_samples_numerical if num_samples_numerical is not None else base_num_samples
 
             cmd.extend([
-                "--model_dir", full_model_path,
-                "--nsfnet_test_dir", global_settings['nsfnet_test_dir'],
-                "--gbn_test_dir", global_settings['gbn_test_dir'],
-                "--output_dir", output_dir,
-                "--batch_size", str(global_settings['batch_size']),
-                "--num_samples", str(numerical_samples)
+                '--model_dir', full_model_path,
+                '--nsfnet_test_dir', global_settings['nsfnet_test_dir'],
+                '--gbn_test_dir', global_settings['gbn_test_dir'],
+                '--output_dir', output_dir,
+                '--batch_size', str(global_settings['batch_size'])
             ])
-            if model_config['use_kan']:
-                cmd.append("--kan")
+
+            if numerical_samples is not None:
+                cmd.extend(['--num_samples', str(numerical_samples)])
+            else:
+                print(f"ℹ️ numerical: 未指定 num_samples，使用完整测试集 (model={model_name})")
+
+            if model_config.get('use_kan'):
+                cmd.append('--kan')
                 if model_config.get('kan_basis') == 'bspline':
-                    cmd.extend(["--kan_basis", "bspline"])
+                    cmd.extend(['--kan_basis', 'bspline'])
                     if model_config.get('kan_grid_size') is not None:
-                        cmd.extend(["--kan_grid_size", str(model_config['kan_grid_size'])])
+                        cmd.extend(['--kan_grid_size', str(model_config['kan_grid_size'])])
                     if model_config.get('kan_spline_order') is not None:
-                        cmd.extend(["--kan_spline_order", str(model_config['kan_spline_order'])])
-        
+                        cmd.extend(['--kan_spline_order', str(model_config['kan_spline_order'])])
+
+        elif experiment_type == 'gradient':
+            cmd.extend([
+                '--model_dir', full_model_path,
+                '--output_dir', output_dir
+            ])
+            for key in ['traffic_min', 'traffic_max', 'num_points']:
+                if key in global_settings:
+                    cmd.extend([f'--{key}', str(global_settings[key])])
+            target = global_settings.get('target', 'delay')
+            if target:
+                cmd.extend(['--target', target])
+            if model_config.get('use_kan'):
+                cmd.append('--use_kan')
+
         return cmd, output_dir
     
     def run_single_experiment(self, experiment_type, model_name, model_config):
@@ -419,7 +427,7 @@ def main():
     parser.add_argument('--config', default='experiment_config.yaml', help='配置文件路径')
     parser.add_argument('--models', nargs='+', help='指定要运行的模型 (默认全部)')
     parser.add_argument('--experiments', nargs='+', 
-                       choices=['evaluate', 'numerical'],
+                       choices=['evaluate', 'numerical', 'gradient'],
                        help='指定要运行的实验类型 (默认全部，仅 evaluate 与 numerical)')
     parser.add_argument('--parallel', action='store_true', help='并行运行实验')
     parser.add_argument('--max_workers', type=int, default=4, help='最大并行工作进程数')

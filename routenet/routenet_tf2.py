@@ -340,6 +340,7 @@ class RouteNet(tf.keras.Model):
         )
         
         # 读出网络（支持KAN和传统MLP）
+        dropout_rate = config.get('dropout_rate', 0.1)
         if use_kan:
             readout_layers = []
             for i in range(config['readout_layers']):
@@ -349,8 +350,8 @@ class RouteNet(tf.keras.Model):
                     spline_order=config.get('kan_spline_order', 3),
                     basis_type=config.get('kan_basis', 'poly')
                 ))
-                if i < config['readout_layers'] - 1:  # 不在最后一层添加dropout
-                    readout_layers.append(tf.keras.layers.Dropout(0.1))
+                if dropout_rate > 0 and i < config['readout_layers'] - 1:  # 不在最后一层添加dropout
+                    readout_layers.append(tf.keras.layers.Dropout(dropout_rate))
             self.readout = tf.keras.Sequential(readout_layers)
         else:
             # 传统 MLP 读出网络
@@ -361,7 +362,8 @@ class RouteNet(tf.keras.Model):
                     activation='selu',
                     kernel_regularizer=tf.keras.regularizers.l2(config['l2'])
                 ))
-                readout_layers.append(tf.keras.layers.Dropout(0.1))
+                if dropout_rate > 0:
+                    readout_layers.append(tf.keras.layers.Dropout(dropout_rate))
             self.readout = tf.keras.Sequential(readout_layers)
         
         # 最终输出层，支持不同的激活函数
@@ -1054,6 +1056,7 @@ def main(args):
         'kan_basis': 'poly',        # 'poly' 或 'bspline'
         'kan_grid_size': 5,         # B样条间隔数，只有在bspline时使用
         'kan_spline_order': 3,      # B样条阶次（degree），典型为3
+        'dropout_rate': args.dropout_rate,
     }
 
     # 设置 TensorBoard 日志目录，包含target和KAN信息
@@ -1092,6 +1095,7 @@ def main(args):
             hp.HParam('T', hp.IntInterval(1, 32)),
             hp.HParam('readout_layers', hp.IntInterval(1, 32)),
             hp.HParam('readout_units', hp.IntInterval(1, 1024)),
+            hp.HParam('dropout_rate', hp.RealInterval(0.0, 1.0)),
         ],
         metrics=[
             hp.Metric('final_best_eval_loss', display_name='Best Val Loss'),
@@ -1119,6 +1123,7 @@ def main(args):
         'T': 3,  # 固定在config中
         'readout_layers': config['readout_layers'],
         'readout_units': config['readout_units'],
+        'dropout_rate': config.get('dropout_rate', 0.1),
     }
 
     # 写入 hparams （需在训练开始前写入一次）
@@ -1531,6 +1536,8 @@ if __name__ == '__main__':
                       help='Use hard constraint (per-sample) instead of soft constraint (batch-average). Only effective when --physics_loss is enabled.')
     parser.add_argument('--lambda_physics', type=float, default=0.1,
                       help='Weight coefficient for physics constraint term (default: 0.1)')
+    parser.add_argument('--dropout_rate', type=float, default=0.1,
+                      help='Dropout rate for readout/MLP/KAN layers (set 0.0 to disable dropout)')
     
     # 课程学习参数
     parser.add_argument('--curriculum', action='store_true',

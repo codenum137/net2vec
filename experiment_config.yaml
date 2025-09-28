@@ -1,5 +1,5 @@
-# 实验配置文件（精简版）
-# 仅包含非物理约束模型：MLP、KAN-Poly、KAN-Bspline
+# 实验配置文件
+# 定义所有模型组合和实验参数
 
 # 全局设置
 global_settings:
@@ -8,11 +8,11 @@ global_settings:
   gbn_test_dir: "data/routenet/gbnbw/tfrecords/evaluate"
   
   # 模型目录基础路径
-  models_base_dir: "fixed_model/old"
+  models_base_dir: "fixed_model/0928"
   
   # 实验参数
   batch_size: 32
-  # num_samples: 1000
+  num_samples: 1000
   
   # 梯度验证参数
   traffic_min: 0.1
@@ -20,24 +20,67 @@ global_settings:
   num_points: 20
   
   # 输出根目录
-  base_output_dir: "experiment_results/0925-opt"
+  base_output_dir: "experiment_results/0928"
 
-# 模型配置方案（由运行器自动生成 models）
+# 模型配置方案（类似train_models.py的结构）
+# 只需要设置 enabled: true 的配置会被实际使用
 model_configs:
+  # 不使用物理约束的配置
   - type: "mlp"
     physics: "none"
-    enabled: true
-
+    enabled: true  # 当前不启用基线模型
+    
+  - type: "kan"  
+    physics: "none"
+    enabled: true  # 当前不启用基线模型
+    
+  # 使用物理约束的配置 - 传统固定lambda
+  - type: "mlp"
+    physics: "soft"
+    enabled: true  
+    
+  - type: "mlp"
+    physics: "hard" 
+    enabled: true  
+    
   - type: "kan"
-    physics: "none"
-    enabled: true  # KAN-Poly
+    physics: "soft"
+    enabled: true  
+    
+  - type: "kan"
+    physics: "hard"
+    enabled: true  
+    
+  # 使用物理约束的配置 - 课程学习（当前启用的配置）
+  - type: "mlp"
+    physics: "soft_cl"
+    enabled: false  # 当前不启用MLP软约束课程学习
+    
+  - type: "mlp"
+    physics: "hard_cl"
+    enabled: false   # ✅ 启用MLP硬约束课程学习
+    
+  - type: "kan"
+    physics: "soft_cl"
+    enabled: false   # ✅ 启用KAN软约束课程学习
+    
+  - type: "kan"
+    physics: "hard_cl"
+    enabled: false  
 
-  - type: "kan_bspline"
-    physics: "none"
-    enabled: true  # KAN-Bspline
-    kan_basis: "bspline"
-    kan_grid_size: 5
-    kan_spline_order: 3
+# lambda_physics参数值（会与上述配置组合生成最终模型）
+lambda_values: [0.05]
+
+# 自动生成规则说明：
+# - enabled: true 的配置会与 lambda_values 中的每个值组合
+# - 生成的模型名称格式：{type}_{physics}_{lambda} （none类型除外）
+# - physics包含"_cl"的配置会自动添加课程学习参数
+# - use_kan会根据type自动设置（kan=true, mlp=false）
+
+# 自动生成的模型配置（基于上述配置和lambda值）
+models:
+
+    
 
 # 实验定义
 experiments:
@@ -45,7 +88,7 @@ experiments:
     script: "routenet/evaluate_routenet_tf2.py"
     required_args:
       - "delay_model_dir"
-      - "nsfnet_test_dir"
+      - "nsfnet_test_dir" 
       - "gbn_test_dir"
       - "output_dir"
     optional_args:
@@ -53,26 +96,26 @@ experiments:
       - "num_samples"
       - "kan"
       
-  # gradient:
-  #   script: "routenet/gradient_sanity_check.py"
-  #   required_args:
-  #     - "model_dir"
-  #     - "output_dir"
-  #   optional_args:
-  #     - "use_kan"
-  #     - "target"
-  #     - "traffic_min"
-  #     - "traffic_max"
-  #     - "num_points"
+  gradient:
+    script: "routenet/gradient_sanity_check.py"
+    required_args:
+      - "model_dir"
+      - "output_dir"
+    optional_args:
+      - "use_kan"
+      - "target"
+      - "traffic_min"
+      - "traffic_max"
+      - "num_points"
       
-  # numerical:
-  #   script: "routenet/numerical_analysis.py"
-  #   required_args:
-  #     - "model_dir"
-  #     - "nsfnet_test_dir"
-  #     - "gbn_test_dir"
-  #     - "output_dir"
-  #   optional_args:
-  #     - "batch_size"
-  #     - "num_samples"
-  #     - "kan"
+  numerical:
+    script: "routenet/numerical_analysis.py"
+    required_args:
+      - "model_dir"
+      - "nsfnet_test_dir"
+      - "gbn_test_dir"
+      - "output_dir"
+    optional_args:
+      - "batch_size"
+      - "num_samples"
+      - "kan"
