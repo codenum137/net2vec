@@ -111,3 +111,4 @@ fixed_model/
 training_logs/
 evaluation_results/
 sample_efficiency_results/
+kan_model/
