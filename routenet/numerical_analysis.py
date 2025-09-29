@@ -49,6 +49,7 @@ def calculate_r2(y_pred, y_true):
     ss_res = np.sum((y_true_clean - y_pred_clean) ** 2)
     
     # 计算R²
+   
     if ss_tot == 0:
         return 1.0 if ss_res == 0 else float('-inf')
     
@@ -96,7 +97,7 @@ def calculate_nll(y_pred_mean, y_pred_scale, y_true):
     # 返回平均NLL
     return np.mean(nll_per_sample)
 
-def load_model(model_dir, target, config, use_kan=False):
+def load_model(model_dir, target, config, use_kan=False, use_final_layer=True):
     """加载指定目标的标准模型（MLP 或 KAN，包括 B-spline）。"""
     # 寻找权重文件
     if use_kan:
@@ -122,7 +123,7 @@ def load_model(model_dir, target, config, use_kan=False):
         raise FileNotFoundError("No model weights found in {}".format(model_dir))
     
     # 使用标准模型创建方式
-    model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
+    model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan, use_final_layer=use_final_layer)
     model_type = "KAN" if use_kan else "MLP"
     kb = config.get('kan_basis', 'poly') if use_kan else None
     if use_kan and kb == 'bspline':
@@ -133,6 +134,9 @@ def load_model(model_dir, target, config, use_kan=False):
         print(f"Using MLP for {target} evaluation")
     print("Loading {} {} model weights from: {}".format(model_type, target, weight_path))
     return model, weight_path
+
+"""Note: Legacy probe utilities have been removed. Single-readout mode now outputs
+final predictions directly (delay:2, drops:1) so numerical analysis works unchanged."""
 
 def evaluate_model_metrics(model, dataset, dataset_name, num_samples=None):
     """
@@ -317,8 +321,6 @@ def compare_models_performance(nsfnet_results, gbn_results, output_dir):
     
     # 计算泛化性能摘要
     print("\n" + "-"*50)
-    print("GENERALIZATION PERFORMANCE SUMMARY")
-    print("-"*50)
     
     for target in targets:
         print(f"\n{target.upper()} Prediction:")
@@ -384,6 +386,9 @@ def main():
                       help='Number of intervals for B-spline grid (only for bspline basis)')
     parser.add_argument('--kan_spline_order', type=int, default=None,
                       help='Degree/order of B-spline basis (only for bspline basis)')
+    # 单头模式：训练时使用 --single-readout（读出层直接输出预测，无最终Dense头）
+    parser.add_argument('--single-readout', action='store_true',
+                      help='Model was trained in single-readout mode (readout directly outputs predictions).')
     
     args = parser.parse_args()
     
@@ -396,7 +401,8 @@ def main():
         'path_state_dim': 2,
         'T': 3,
         'readout_units': 8,
-        'readout_layers': 2,
+        # IMPORTANT: must match training architecture; training default was 1
+        'readout_layers': 1,
         'l2': 0.1,
         'l2_2': 0.01,
     }
@@ -417,21 +423,20 @@ def main():
                 config['kan_spline_order'] = args.kan_spline_order
 
     model_type = "KAN" if args.kan else "MLP"
-    if args.kan:
-        kb = config.get('kan_basis', 'poly')
-        if kb == 'bspline':
-            suffix = f" (basis=bspline, grid={config.get('kan_grid_size', 5)}, order={config.get('kan_spline_order', 3)})"
-        else:
-            suffix = " (basis=poly)"
-    else:
-        suffix = ""
-    print(f"Starting numerical analysis for {model_type} model{suffix}...")
+    print(f"Starting numerical analysis for {model_type} model...")
     print(f"Model dir: {args.model_dir}")
     print(f"NSFNet test dir: {args.nsfnet_test_dir}")
     print(f"GBN test dir: {args.gbn_test_dir}")
-    
-    # 加载模型
-    delay_model, delay_weight_path = load_model(args.model_dir, 'delay', config, use_kan=args.kan)
+
+    # 单头模式：强制 readout_layers=1，并禁用 final_layer
+    if args.single_readout and config.get('readout_layers', 1) != 1:
+        print('[Info] Overriding readout_layers -> 1 for single-readout numerical analysis consistency')
+        config['readout_layers'] = 1
+
+    delay_model, delay_weight_path = load_model(
+        args.model_dir, 'delay', config, use_kan=args.kan,
+        use_final_layer=not args.single_readout
+    )
     
     # 创建数据集
     nsfnet_files = tf.io.gfile.glob(os.path.join(args.nsfnet_test_dir, '*.tfrecords'))
@@ -455,12 +460,30 @@ def main():
         delay_model.load_weights(delay_weight_path)
         print("Model loaded successfully!")
     except Exception as e:
-        print(f"Error loading weights: {e}")
-        # 尝试重新构建模型
-        delay_model.build(input_shape=(None, None))
-        delay_model.load_weights(delay_weight_path)
-        print("Model loaded successfully after rebuilding!")
+        print(f"[LoadWarning] Initial load failed: {e}")
+        # Heuristic fallback: if mismatch likely due to readout_layers, retry with 1 layer
+        if config.get('readout_layers', 1) != 1:
+            print("[LoadFallback] Retrying with readout_layers=1 (training default)...")
+            config['readout_layers'] = 1
+            delay_model, _ = load_model(
+                args.model_dir, 'delay', config, use_kan=args.kan,
+                use_final_layer=True
+            )
+            for features, labels in nsfnet_dataset.take(1):
+                _ = delay_model(features, training=False)
+                break
+            delay_model.load_weights(delay_weight_path)
+            print("[LoadFallback] Model loaded successfully with readout_layers=1")
+        else:
+            raise
     
+    # single-readout 模式提示输出形状确认
+    if args.single_readout:
+        for features, labels in nsfnet_dataset.take(1):
+            sample_out = delay_model(features, training=False)
+            print(f"[Mode] Single-readout numerical analysis. Output shape: {sample_out.shape} (expect [...,2] for delay)")
+            break
+
     # 评估NSFNet（训练拓扑）
     nsfnet_results = evaluate_model_metrics(
         delay_model, nsfnet_dataset, "NSFNet", args.num_samples

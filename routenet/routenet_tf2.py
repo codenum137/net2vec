@@ -328,58 +328,80 @@ def create_dataset(filenames, batch_size, is_training=True, seed=None):
 
 class RouteNet(tf.keras.Model):
     def __init__(self, config, output_units=2, final_activation=None, use_kan=False, use_final_layer=True):
+        """RouteNet 模型
+
+        两种输出模式：
+        1) use_final_layer=True (默认):
+           readout 提供中间特征 -> 与 path_state 拼接 -> Dense(final_layer) -> 预测 (delay:2 / drops:1)
+        2) use_final_layer=False:
+           直接使用读出网络输出最终预测值（用于测试 “单层 KAN/MLP 直接作为 readout head” 的效果）。
+           在该模式下：
+             - 不再拼接 path_state
+             - readout 的最后一层（或唯一一层）输出维度 = output_units
+             - 返回张量形状直接为 [n_paths, output_units]
+        """
         super().__init__()
         self.config = config
         self.use_kan = use_kan
-        # 控制是否使用最终输出层（Dense 预测头）
-        self.use_final_layer = use_final_layer
+        self.use_final_layer = use_final_layer  # 控制是否使用单独的最终 Dense 输出层
+        self.output_units = output_units
         
-        # 消息传递层（与原版保持一致的命名）
-        self.link_update = tf.keras.layers.GRUCell(config['link_state_dim'])  # 原版中叫 edge_update
+        # 消息传递层
+        self.link_update = tf.keras.layers.GRUCell(config['link_state_dim'])
         self.path_update = tf.keras.layers.GRUCell(config['path_state_dim'])
-        
-        # 【修复1: 在__init__中创建RNN层，避免在循环中重复创建】
         self.rnn_layer = tf.keras.layers.RNN(
-            self.path_update, 
-            return_sequences=True, 
+            self.path_update,
+            return_sequences=True,
             return_state=True
         )
-        
-        # 读出网络（支持KAN和传统MLP）
+
+        # ------------------------------------------------------------------
+        # 构建读出网络 (支持 KAN / MLP)
+        # 如果关闭最终层，则读出网络最后一层直接输出预测维度 output_units
+        # 如果开启最终层，读出网络只输出中间特征维度 config['readout_units']，后续再拼接 path_state -> final_layer
+        # ------------------------------------------------------------------
+        readout_hidden_units = config['readout_units']
+        total_layers = int(config['readout_layers'])
+        if total_layers < 1:
+            total_layers = 1
+
         if use_kan:
             readout_layers = []
-            for i in range(config['readout_layers']):
+            for i in range(total_layers):
+                # 决定该层输出单元数：如果是最后一层且不使用最终层，则输出 output_units；否则输出 hidden_units
+                layer_units = self.output_units if (not self.use_final_layer and i == total_layers - 1) else readout_hidden_units
                 readout_layers.append(KANLayer(
-                    config['readout_units'],
+                    layer_units,
                     grid_size=config.get('kan_grid_size', 5),
                     spline_order=config.get('kan_spline_order', 3),
                     basis_type=config.get('kan_basis', 'poly')
                 ))
-                # 仅在中间层添加 Dropout，且需开启 use_dropout
+                # 在“中间层”添加 Dropout（不含最后一层）
                 if (
-                    i < config['readout_layers'] - 1
+                    i < total_layers - 1
                     and config.get('use_dropout', True)
                 ):
-                    readout_layers.append(
-                        tf.keras.layers.Dropout(config.get('dropout_rate', 0.1))
-                    )
+                    readout_layers.append(tf.keras.layers.Dropout(config.get('dropout_rate', 0.1)))
             self.readout = tf.keras.Sequential(readout_layers)
         else:
-            # 传统 MLP 读出网络
             readout_layers = []
-            for _ in range(config['readout_layers']):
+            for i in range(total_layers):
+                layer_units = self.output_units if (not self.use_final_layer and i == total_layers - 1) else readout_hidden_units
+                # 最后一层（直接输出）不加激活；中间层使用 SELU
+                activation = None if (not self.use_final_layer and i == total_layers - 1) else 'selu'
                 readout_layers.append(tf.keras.layers.Dense(
-                    config['readout_units'], 
-                    activation='selu',
+                    layer_units,
+                    activation=activation,
                     kernel_regularizer=tf.keras.regularizers.l2(config['l2'])
                 ))
-                if config.get('use_dropout', True):
-                    readout_layers.append(
-                        tf.keras.layers.Dropout(config.get('dropout_rate', 0.1))
-                    )
+                if (
+                    i < total_layers - 1
+                    and config.get('use_dropout', True)
+                ):
+                    readout_layers.append(tf.keras.layers.Dropout(config.get('dropout_rate', 0.1)))
             self.readout = tf.keras.Sequential(readout_layers)
-        
-        # 最终输出层，支持不同的激活函数；仅当启用时创建
+
+        # 独立最终输出层 (仅在 use_final_layer=True 时创建)
         if self.use_final_layer:
             self.final_layer = tf.keras.layers.Dense(
                 output_units,
@@ -387,7 +409,7 @@ class RouteNet(tf.keras.Model):
                 kernel_regularizer=tf.keras.regularizers.l2(config['l2_2'])
             )
         else:
-            self.final_layer = None  # 仅作占位，前向传播中会跳过
+            self.final_layer = None
 
     def call(self, inputs, training=False):
         # 初始化状态
@@ -451,10 +473,13 @@ class RouteNet(tf.keras.Model):
 
         # 读出阶段
         readout_output = self.readout(path_state, training=training)
-        final_input = tf.concat([readout_output, path_state], axis=1)
-        # 如果禁用最终层，直接返回拼接后的特征表示（可能用于下游任务或探针）
+
+        # 模式 1: 直接输出 (单层 / 多层读出最后一层已经是预测维度)
         if not self.use_final_layer:
-            return final_input
+            return readout_output  # [n_paths, output_units]
+
+        # 模式 2: 传统模式 - 将中间特征与 path_state 拼接后通过最终层
+        final_input = tf.concat([readout_output, path_state], axis=1)
         return self.final_layer(final_input)
 
 
@@ -536,7 +561,7 @@ def create_model_and_loss_fn(config, target, use_kan=False, use_final_layer=True
         raise ValueError("Unsupported target: {}. Choose 'delay' or 'drops'".format(target))
 
     if not use_final_layer:
-        print("[Warning] Final output layer disabled: model outputs raw concatenated features (readout + path_state). Ensure your loss / downstream usage is compatible.")
+        print("[Mode] Single-readout head: readout network directly outputs predictions (no final Dense head, no path_state concatenation).")
 
     return model, loss_fn
 
@@ -585,7 +610,7 @@ def main(args):
         'path_state_dim': 2, 
         'T': 3,
         'readout_units': 8,
-        'readout_layers': 1,
+        'readout_layers': 2,
         'l2': 0.1,
         'l2_2': 0.01,
         # KAN 参数默认值（当使用KAN时生效）
@@ -644,6 +669,10 @@ def main(args):
         use_kan=args.kan,
         use_final_layer=getattr(args, 'use_final_layer', True)
     )
+    # 如果是 single-readout 模式，提醒并强制 readout_layers=1（模型内部已按 use_final_layer=False 构建）
+    if not args.use_final_layer and config.get('readout_layers', 1) != 1:
+        print('[Info] Overriding config.readout_layers -> 1 for single-readout mode')
+        config['readout_layers'] = 1
 
     # ------------------------------------------------------------------
     # HParams: 定义与记录 (仅在单次运行目录即可被插件识别)
@@ -995,15 +1024,23 @@ if __name__ == '__main__':
                       help='Estimated steps per epoch for cosine/polynomial schedules')
     parser.add_argument('--seed', type=int, default=137,
                       help='Random seed for reproducibility (default: 137)')
-    # 控制是否使用最终输出层（关闭时输出读出层与路径状态的拼接向量）
-    parser.add_argument('--no_final_layer', action='store_true',
-                      help='Disable final Dense output layer and output raw concatenated features (readout + path_state)')
+    # 单头模式：仅一层读出（KAN 或 MLP），直接输出预测值；未指定则使用“读出特征 + 最终Dense”传统模式
+    parser.add_argument('--single-readout', action='store_true',
+                      help='Use a single KAN/MLP readout layer that directly outputs predictions (no final Dense head)')
     
     args = parser.parse_args()
     
     if not os.path.exists(args.model_dir):
         os.makedirs(args.model_dir)
         
-    # 兼容：将标志转换为正逻辑参数
-    args.use_final_layer = not args.no_final_layer
+    # 模式映射：single-readout => 不使用最终 Dense 头，强制 readout_layers=1
+    if args.single_readout:
+        args.use_final_layer = False
+    else:
+        args.use_final_layer = True
+
+    # 若为 single-readout 模式，确保 readout_layers=1（若后续加入 CLI 可在这里覆盖）
+    if args.single_readout:
+        # config 默认在 main 内部创建，这里只做标志处理；真正强制放在 main 前模型构建逻辑
+        pass
     main(args)

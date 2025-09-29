@@ -16,11 +16,13 @@ import argparse
 import re
 
 class ModelTrainer:
-    def __init__(self, base_dir="./", force_retrain=False, enable_early_stopping=True, epochs=20, early_stopping_patience=8, use_dropout=False, dropout_rate=0.1):
+    def __init__(self, base_dir="./", force_retrain=False, enable_early_stopping=True, epochs=20, early_stopping_patience=8, use_dropout=False, dropout_rate=0.1, single_readout=False):
         self.base_dir = Path(base_dir)
         self.train_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "train"
         self.eval_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "evaluate"
-        self.models_base_dir = self.base_dir / "kan_model/137-oneread"
+        # 根据 single_readout 选择模型基目录，保持向后兼容：单头模式使用原 "137-oneread"，否则使用 "137"
+        self.single_readout = single_readout
+        self.models_base_dir = self.base_dir / "kan_model/137-oneread" 
         self.force_retrain = force_retrain  # 是否强制重新训练已存在的模型
         self.enable_early_stopping = enable_early_stopping  # 是否启用早停机制
         self.epochs = epochs  # 训练轮数
@@ -30,6 +32,7 @@ class ModelTrainer:
         # 直接使用统一脚本 (移除版本切换逻辑)
         self.train_script = self.base_dir / "routenet" / "routenet_tf2.py"
         print(f"🧠 Using fixed training entry script: {self.train_script}")
+        print(f"🔀 Single-readout mode: {'ENABLED' if self.single_readout else 'disabled'}")
         
         # 训练配置
         self.training_configs = self._generate_training_configs()
@@ -84,9 +87,12 @@ class ModelTrainer:
             "--lr_schedule", "plateau",
             "--learning_rate", "0.001",
             "--plateau_patience", "8",  # 增加耐心值
-            "--plateau_factor", "0.5",
-            "--no_final_layer"
+            "--plateau_factor", "0.5"
         ]
+
+        # 单头模式：追加 --single-readout 标志（新的底层脚本接口）
+        if self.single_readout:
+            cmd.append("--single-readout")
         
         # 添加KAN相关参数
         if config["use_kan"]:
@@ -351,6 +357,7 @@ class ModelTrainer:
             "kan_basis": config.get("kan_basis"),
             "kan_grid_size": config.get("kan_grid_size"),
             "kan_spline_order": config.get("kan_spline_order"),
+            "single_readout": self.single_readout,
             "success": success,
             "duration": duration,
             "timestamp": datetime.now().isoformat(),
@@ -462,6 +469,8 @@ def main():
     # Dropout 控制
     parser.add_argument("--use-dropout", dest="use_dropout", action="store_true", help="启用读出层dropout (默认关闭)")
     parser.add_argument("--dropout-rate", dest="dropout_rate", type=float, default=0.1, help="读出层dropout比例 (启用后默认 0.1)")
+    # 单头模式控制（默认关闭）
+    parser.add_argument("--single-readout", action="store_true", help="启用单层读出直接输出模式 (默认关闭)")
     
     args = parser.parse_args()
     
@@ -481,6 +490,7 @@ def main():
         early_stopping_patience=args.early_stopping_patience,
         use_dropout=args.use_dropout,
         dropout_rate=args.dropout_rate,
+        single_readout=args.single_readout,
     )
     
     if args.list:

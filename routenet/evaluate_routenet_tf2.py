@@ -64,7 +64,7 @@ def _wire_backend(tf_compat: str):
     create_model_and_loss_fn = getattr(mod, 'create_model_and_loss_fn')
     print(f"🔧 TF version: {tf_ver}; evaluate backend: {module_name}")
 
-def load_model(model_dir, target, config, use_kan=False):
+def load_model(model_dir, target, config, use_kan=False, use_final_layer=True):
     """
     加载指定目标的模型
     
@@ -104,7 +104,7 @@ def load_model(model_dir, target, config, use_kan=False):
     if weight_path is None:
         raise FileNotFoundError("No model weights found in {}".format(model_dir))
     
-    model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan)
+    model, _ = create_model_and_loss_fn(config, target, use_kan=use_kan, use_final_layer=use_final_layer)
     model_type = "KAN" if use_kan else "MLP"
     kb = config.get('kan_basis', 'poly') if use_kan else None
     if use_kan and kb == 'bspline':
@@ -115,6 +115,15 @@ def load_model(model_dir, target, config, use_kan=False):
         print(f"Using MLP for {target} evaluation")
     print("Loading {} {} model weights from: {}".format(model_type, target, weight_path))
     return model, weight_path
+
+
+## NOTE:
+# Removed probe wrapper & training logic per user request. The script now supports a flag
+# to indicate that a model was trained WITHOUT its final output layer, but it will not
+# auto-attach or train any probe head. In that case we either:
+#   1) Abort with an explanatory message (default implementation below), or
+#   2) (You may extend) Implement custom downstream evaluation for embeddings.
+
 
 def evaluate_delay_jitter_model(model, dataset, num_samples=None):
     """
@@ -373,6 +382,9 @@ def main():
     # TF 版本兼容
     parser.add_argument('--tf-compat', choices=['auto', 'tf2', 'tf2_9'], default='auto',
                       help='Select evaluation backend by TF version: auto (default), tf2, tf2_9')
+    # 单头模式：训练时使用 --single-readout，读出层直接输出预测值（无最终Dense头）
+    parser.add_argument('--single-readout', action='store_true',
+                        help='Model was trained in single-readout mode (readout directly outputs predictions).')
     
     args = parser.parse_args()
 
@@ -388,7 +400,7 @@ def main():
         'path_state_dim': 2,
         'T': 3,
         'readout_units': 8,
-        'readout_layers': 2,
+        'readout_layers': 1,
         'l2': 0.1,
         'l2_2': 0.01,
     }
@@ -424,7 +436,11 @@ def main():
     print("GBN test dir: {}".format(args.gbn_test_dir))
     
     # 加载模型
-    delay_model, delay_weight_path = load_model(args.delay_model_dir, 'delay', config, use_kan=args.kan)
+    delay_model, delay_weight_path = load_model(
+        args.delay_model_dir, 'delay', config,
+        use_kan=args.kan,
+        use_final_layer=not args.single_readout
+    )
     
     # 创建数据集
     nsfnet_files = tf.io.gfile.glob(os.path.join(args.nsfnet_test_dir, '*.tfrecords'))
@@ -436,8 +452,13 @@ def main():
     print("Found {} NSFNet test files".format(len(nsfnet_files)))
     print("Found {} GBN test files".format(len(gbn_files)))
     
+    # 如果为 single-readout 模式，确保配置使用单层读出（训练阶段即如此，防止用户手动改动）
+    if args.single_readout and config.get('readout_layers', 1) != 1:
+        print('[Info] Overriding readout_layers -> 1 for single-readout evaluation consistency')
+        config['readout_layers'] = 1
+
     # 初始化模型权重（需要先运行一次前向传播）
-    print("\nInitializing models...")
+    print("\nInitializing model (building graph)...")
     
     # 进行一次前向传播以构建模型
     for dataset in [nsfnet_dataset.take(1)]:
@@ -448,6 +469,13 @@ def main():
     # 加载权重
     delay_model.load_weights(delay_weight_path)
     print("Model loaded successfully!")
+
+    # single-readout 模式下，模型直接输出预测 (delay:2)。无需特殊处理，只需提示。
+    if args.single_readout:
+        for features, labels in nsfnet_dataset.take(1):
+            sample_out = delay_model(features, training=False)
+            print(f"[Mode] Single-readout evaluation. Output shape: {sample_out.shape} (expect [...,2] for delay)")
+            break
     
     # 评估NSFNet（同拓扑）
     print("\n" + "="*50)

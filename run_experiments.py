@@ -71,12 +71,19 @@ class ExperimentRunner:
                 model_name = f"{model_config['type']}_none"
 
             # 生成模型配置
+            # 兼容：如果旧配置里有 no_final_layer，映射到 single_readout
+            legacy_no_final = model_config.get('no_final_layer', False)
+            single_readout = model_config.get('single_readout', legacy_no_final)
+            if legacy_no_final and 'single_readout' not in model_config:
+                print(f"⚠️  配置 {model_name} 使用已废弃字段 no_final_layer -> 自动映射为 single_readout=True")
+
             model_def = {
                 'model_type': model_config['type'],
                 'physics_type': 'none',
                 'lambda_physics': 0.0,
                 'delay_model_dir': model_name,
                 'use_kan': model_config['type'] in ['kan', 'kan_bspline'],
+                'single_readout': single_readout,
             }
 
             # 透传 KAN 基函数配置（如果有）
@@ -206,6 +213,10 @@ class ExperimentRunner:
                         cmd.extend(["--kan_grid_size", str(model_config['kan_grid_size'])])
                     if model_config.get('kan_spline_order') is not None:
                         cmd.extend(["--kan_spline_order", str(model_config['kan_spline_order'])])
+            # Propagate no-final-layer flag
+            if model_config.get('single_readout'):
+                cmd.append("--single-readout")
+                print(f"ℹ️  evaluate: 模型 {model_name} 为 single_readout -> 添加 --single-readout")
 
         elif experiment_type == "numerical":
             # numerical 仍然需要 num_samples，允许通过 num_samples_numerical 覆盖
@@ -234,6 +245,10 @@ class ExperimentRunner:
                         cmd.extend(["--kan_grid_size", str(model_config['kan_grid_size'])])
                     if model_config.get('kan_spline_order') is not None:
                         cmd.extend(["--kan_spline_order", str(model_config['kan_spline_order'])])
+            # numerical 分析脚本当前未显式支持 single-readout 标志；如后续需要，可在脚本中加入同名参数。
+            # 这里暂不传递避免未知参数错误；如果未来 numerical 支持，需要在此处追加 --single-readout。
+            if model_config.get('single_readout'):
+                print(f"ℹ️  numerical: 模型 {model_name} 为 single_readout -> 未传递标志 (脚本暂未支持，确保脚本能根据权重正确加载)")
         
         return cmd, output_dir
     
