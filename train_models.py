@@ -16,24 +16,20 @@ import argparse
 import re
 
 class ModelTrainer:
-    def __init__(self, base_dir="./", force_retrain=False, enable_early_stopping=True, epochs=40, early_stopping_patience=8, tf_compat='auto', use_dropout=True, dropout_rate=0.1):
+    def __init__(self, base_dir="./", force_retrain=False, enable_early_stopping=True, epochs=20, early_stopping_patience=8, use_dropout=True, dropout_rate=0.1):
         self.base_dir = Path(base_dir)
         self.train_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "train"
         self.eval_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "evaluate"
-        self.models_base_dir = self.base_dir / "fixed_model/0925/no-dropout"
+        self.models_base_dir = self.base_dir / "kan_model/0929"
         self.force_retrain = force_retrain  # 是否强制重新训练已存在的模型
         self.enable_early_stopping = enable_early_stopping  # 是否启用早停机制
         self.epochs = epochs  # 训练轮数
         self.early_stopping_patience = early_stopping_patience  # 早停耐心值
-        self.tf_compat = tf_compat  # 'auto' | 'tf2' | 'tf2_9'
         self.use_dropout = use_dropout
         self.dropout_rate = dropout_rate
-
-        # 自动检测 TensorFlow 版本并选择对应训练脚本
-        self.tf_version = self._detect_tf_version()
-        self.train_script = self._select_train_script(self.tf_version, self.tf_compat)
-        print(f"🧪 TensorFlow version detected: {self.tf_version or 'unknown'}")
-        print(f"🧠 Using training entry script: {self.train_script}")
+        # 直接使用统一脚本 (移除版本切换逻辑)
+        self.train_script = self.base_dir / "routenet" / "routenet_tf2.py"
+        print(f"🧠 Using fixed training entry script: {self.train_script}")
         
         # 训练配置
         self.training_configs = self._generate_training_configs()
@@ -73,43 +69,6 @@ class ModelTrainer:
 
         return configs
     
-    # 过去用于组合物理约束模型目录的函数已不再需要（仅训练 none 类配置）
-    
-    def _detect_tf_version(self):
-        """尝试检测当前环境中的 TensorFlow 版本。失败时返回 None。"""
-        try:
-            import tensorflow as tf  # noqa: F401
-            ver = getattr(tf, '__version__', None)
-            return ver
-        except Exception:
-            return None
-
-    def _select_train_script(self, tf_version, override):
-        """根据 TensorFlow 版本或用户覆盖选择训练脚本。"""
-        tf2_path = self.base_dir / "routenet" / "routenet_tf2.py"
-        tf29_path = self.base_dir / "routenet" / "routenet_tf2_9.py"
-
-        # 处理覆盖
-        if override == 'tf2':
-            return tf2_path
-        if override == 'tf2_9':
-            return tf29_path
-
-        # 自动判断
-        if not tf_version:
-            # 未能检测版本，默认使用新版脚本
-            return tf2_path
-        # 解析主次版本号
-        m = re.match(r"^(\d+)\.(\d+)", tf_version)
-        if not m:
-            return tf2_path
-        major = int(m.group(1))
-        minor = int(m.group(2))
-        if major < 2:
-            return tf29_path
-        if major == 2 and minor <= 9:
-            return tf29_path
-        return tf2_path
     
     def _build_training_command(self, config):
         """构建训练命令"""
@@ -144,8 +103,10 @@ class ModelTrainer:
         # Dropout 开关与比例（仅 routenet_tf2.py 支持；tf2_9 版本暂不透传）
         script_name = os.path.basename(str(self.train_script))
         if script_name == 'routenet_tf2.py':
-            if not self.use_dropout:
-                cmd.append("--no_dropout")
+            # 新逻辑：默认关闭，如需开启则使用 --use_dropout
+            if self.use_dropout:
+                cmd.append("--use_dropout")
+            # 只有在启用 dropout 时传递 rate 更有意义，但保持兼容始终传递
             if self.dropout_rate is not None:
                 cmd.extend(["--dropout_rate", str(self.dropout_rate)])
         
@@ -488,7 +449,7 @@ class ModelTrainer:
             print()
 
 def main():
-    parser = argparse.ArgumentParser(description="RouteNet模型串行训练脚本")
+    parser = argparse.ArgumentParser(description="RouteNet模型串行训练脚本 (统一使用 routenet_tf2.py)")
     parser.add_argument("--list", action="store_true", help="列出所有训练配置")
     parser.add_argument("--start-from", type=str, help="从指定模型开始训练")
     parser.add_argument("--models", nargs="+", help="仅训练指定的模型")
@@ -498,8 +459,7 @@ def main():
     # 早停相关参数
     parser.add_argument("--no-early-stopping", action="store_true", help="禁用早停机制")
     parser.add_argument("--early-stopping-patience", type=int, default=8, help="早停耐心值 (默认: 8)")
-    # TF 版本兼容选择
-    parser.add_argument("--tf-compat", choices=['auto', 'tf2', 'tf2_9'], default='auto', help="训练脚本选择：auto 根据TF版本自动选择；tf2 使用 routenet_tf2.py；tf2_9 使用 routenet_tf2_9.py")
+    # 已移除 TF 版本切换功能，保留占位注释以便文档更新
     # Dropout 控制
     parser.add_argument("--no-dropout", dest="use_dropout", action="store_false", help="禁用读出层的dropout（默认启用）")
     parser.add_argument("--dropout-rate", dest="dropout_rate", type=float, default=0.1, help="读出层dropout比例 (默认 0.1)")
@@ -516,11 +476,10 @@ def main():
 
     # 创建trainer，传入早停相关参数
     trainer = ModelTrainer(
-        base_dir=args.base_dir, 
+        base_dir=args.base_dir,
         force_retrain=args.force,
         enable_early_stopping=not args.no_early_stopping,
         early_stopping_patience=args.early_stopping_patience,
-        tf_compat=args.tf_compat,
         use_dropout=args.use_dropout,
         dropout_rate=args.dropout_rate,
     )

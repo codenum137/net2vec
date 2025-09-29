@@ -5,6 +5,8 @@ import argparse
 import os
 from tqdm import tqdm
 import datetime
+import random  # Added for reproducibility seeding
+from tensorboard.plugins.hparams import api as hp  # HParams logging
 
 # ==============================================================================
 # KAN (Kolmogorov-Arnold Networks) Implementation
@@ -301,10 +303,14 @@ def transformation_func(features_batch, labels_batch):
     
     return merged_features, merged_labels
 
-def create_dataset(filenames, batch_size, is_training=True):
+def create_dataset(filenames, batch_size, is_training=True, seed=None):
     ds = tf.data.TFRecordDataset(filenames)
     if is_training:
-        ds = ds.shuffle(1000)
+        # Use provided seed for reproducible shuffling if given
+        if seed is not None:
+            ds = ds.shuffle(1000, seed=seed, reshuffle_each_iteration=True)
+        else:
+            ds = ds.shuffle(1000)
     
     ds = ds.map(parse_fn, num_parallel_calls=tf.data.AUTOTUNE)
     
@@ -548,6 +554,20 @@ def eval_step(model, features, labels, loss_fn):
 # 4. 主执行逻辑
 # ==============================================================================
 
+def set_global_seed(seed: int):
+    """Set seeds for Python, NumPy, and TensorFlow to improve reproducibility.
+
+    Note: Full bit‑exact determinism may still depend on hardware (GPU algorithms),
+    CUDA/cuDNN versions, and certain non-deterministic ops. We also set the
+    TF_DETERMINISTIC_OPS environment flag where respected.
+    """
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ['TF_DETERMINISTIC_OPS'] = '1'  # Best effort for deterministic GPU ops
+    random.seed(seed)
+    np.random.seed(seed)
+    tf.random.set_seed(seed)
+
+
 def main(args):
     config = {
         'link_state_dim': 4,
@@ -561,8 +581,8 @@ def main(args):
         'kan_basis': 'poly',        # 'poly' 或 'bspline'
         'kan_grid_size': 5,         # B样条间隔数，只有在bspline时使用
         'kan_spline_order': 3,      # B样条阶次（degree），典型为3
-        # Dropout 默认开启，率为 0.1
-        'use_dropout': True,
+    # Dropout 默认关闭，率为 0.1 (可通过 --use_dropout 启用)
+    'use_dropout': False,
         'dropout_rate': 0.1,
     }
 
@@ -577,12 +597,19 @@ def main(args):
     train_summary_writer = tf.summary.create_file_writer(train_log_dir)
     val_summary_writer = tf.summary.create_file_writer(val_log_dir)
 
+    # ------------------------------------------------------------------
+    # Reproducibility: set seeds BEFORE creating datasets/models
+    # ------------------------------------------------------------------
+    set_global_seed(args.seed)
+    print(f"[Seed] Using global random seed: {args.seed}")
+
     train_files = tf.io.gfile.glob(os.path.join(args.train_dir, '*.tfrecords'))
-    train_dataset = create_dataset(train_files, args.batch_size, is_training=True)
+    train_dataset = create_dataset(train_files, args.batch_size, is_training=True, seed=args.seed)
     print("Found {} training files.".format(len(train_files)))
 
     eval_files = tf.io.gfile.glob(os.path.join(args.eval_dir, '*.tfrecords'))
-    eval_dataset = create_dataset(eval_files, args.batch_size, is_training=False)
+    # Evaluation dataset not shuffled; seed kept for API symmetry / future use
+    eval_dataset = create_dataset(eval_files, args.batch_size, is_training=False, seed=args.seed)
     print("Found {} evaluation files.".format(len(eval_files)))
 
     # 根据target创建模型和损失函数
@@ -594,13 +621,59 @@ def main(args):
     if args.kan_spline_order is not None:
         config['kan_spline_order'] = args.kan_spline_order
 
-    # 覆盖 Dropout 配置
-    if args.no_dropout:
-        config['use_dropout'] = False
+    # 覆盖 Dropout 配置：仅当显式启用时才开启
+    if getattr(args, 'use_dropout', False):
+        config['use_dropout'] = True
     if args.dropout_rate is not None:
         config['dropout_rate'] = float(args.dropout_rate)
 
     model, loss_fn = create_model_and_loss_fn(config, args.target, use_kan=args.kan)
+
+    # ------------------------------------------------------------------
+    # HParams: 定义与记录 (仅在单次运行目录即可被插件识别)
+    # ------------------------------------------------------------------
+    HP_TARGET = hp.HParam('target', display_name='target')
+    HP_LR = hp.HParam('learning_rate', display_name='learning_rate')
+    HP_BATCH = hp.HParam('batch_size', display_name='batch_size')
+    HP_T = hp.HParam('T', display_name='message_passing_T')
+    HP_LINK_DIM = hp.HParam('link_state_dim', display_name='link_state_dim')
+    HP_PATH_DIM = hp.HParam('path_state_dim', display_name='path_state_dim')
+    HP_READOUT_UNITS = hp.HParam('readout_units', display_name='readout_units')
+    HP_READOUT_LAYERS = hp.HParam('readout_layers', display_name='readout_layers')
+    HP_L2 = hp.HParam('l2')
+    HP_L2_2 = hp.HParam('l2_2')
+    HP_DROPOUT = hp.HParam('dropout_rate')
+    HP_USE_DROPOUT = hp.HParam('use_dropout')
+    HP_KAN = hp.HParam('kan_enabled')
+    HP_KAN_BASIS = hp.HParam('kan_basis')
+    HP_KAN_GRID = hp.HParam('kan_grid_size')
+    HP_KAN_ORDER = hp.HParam('kan_spline_order')
+    HP_LR_SCHED = hp.HParam('lr_schedule')
+    HP_SEED = hp.HParam('seed')
+
+    # 记录一次性超参数 (使用 train_summary_writer)
+    hparams_values = {
+        HP_TARGET: args.target,
+        HP_LR: args.learning_rate,
+        HP_BATCH: args.batch_size,
+        HP_T: config['T'],
+        HP_LINK_DIM: config['link_state_dim'],
+        HP_PATH_DIM: config['path_state_dim'],
+        HP_READOUT_UNITS: config['readout_units'],
+        HP_READOUT_LAYERS: config['readout_layers'],
+        HP_L2: config['l2'],
+        HP_L2_2: config['l2_2'],
+        HP_DROPOUT: config['dropout_rate'],
+        HP_USE_DROPOUT: 1 if config.get('use_dropout', True) else 0,
+        HP_KAN: 1 if args.kan else 0,
+        HP_KAN_BASIS: config.get('kan_basis'),
+        HP_KAN_GRID: config.get('kan_grid_size'),
+        HP_KAN_ORDER: config.get('kan_spline_order'),
+        HP_LR_SCHED: args.lr_schedule,
+        HP_SEED: args.seed,
+    }
+    with train_summary_writer.as_default():
+        hp.hparams(hparams_values)  # 让 HParams 插件识别本次实验
     
     # 创建动态学习率调度器
     if args.lr_schedule == 'exponential':
@@ -815,6 +888,10 @@ def main(args):
     print("Model weights saved as: {}".format(
         os.path.join(args.model_dir, "best_{}_{}.weights.h5".format(args.target, model_suffix))))
 
+    # 记录最终最佳验证损失到 HParams 关联的 metric（使用与 val writer）
+    with val_summary_writer.as_default():
+        tf.summary.scalar('hparams/best_eval_loss', best_eval_loss, step=0)
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='RouteNet TF2 Implementation')
     parser.add_argument('--train_dir', type=str, required=True, 
@@ -843,8 +920,9 @@ if __name__ == '__main__':
     parser.add_argument('--lr_schedule', type=str, choices=['fixed', 'exponential', 'cosine', 'polynomial', 'plateau'], 
                       default='fixed', help='Learning rate schedule strategy')
     # Dropout 开关与比例
-    parser.add_argument('--no_dropout', action='store_true',
-                      help='Disable dropout layers in readout (default: enabled)')
+    # Dropout 控制: 默认关闭；使用 --use_dropout 启用
+    parser.add_argument('--use_dropout', action='store_true',
+                      help='Enable dropout layers in readout (default: disabled)')
     parser.add_argument('--dropout_rate', type=float, default=0.1,
                       help='Dropout rate when enabled (default: 0.1)')
     
@@ -870,11 +948,12 @@ if __name__ == '__main__':
     parser.add_argument('--early_stopping_restore_best', action='store_true',
                       help='Restore model weights from the epoch with the best value of the monitored quantity')
     
-    # 已移除物理约束与课程学习相关参数
     
     # 用于cosine和polynomial调度的steps_per_epoch估计
     parser.add_argument('--steps_per_epoch', type=int, default=100,
                       help='Estimated steps per epoch for cosine/polynomial schedules')
+    parser.add_argument('--seed', type=int, default=137,
+                      help='Random seed for reproducibility (default: 137)')
     
     args = parser.parse_args()
     
