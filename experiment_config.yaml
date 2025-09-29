@@ -8,7 +8,7 @@ global_settings:
   gbn_test_dir: "data/routenet/gbnbw/tfrecords/evaluate"
 
   # 模型目录基础路径（与 train_models.py 保持一致）
-  models_base_dir: "fixed_model/0925"
+  models_base_dir: "kan_model/137"
 
   # 实验参数
   batch_size: 32
@@ -29,7 +29,7 @@ global_settings:
   num_samples: 2000
 
   # 输出根目录
-  base_output_dir: "experiment_results/0925"
+  base_output_dir: "experiment_results/kan_model/137"
 
 # 模型配置方案（由运行器自动生成 models）
 model_configs:
