@@ -887,6 +887,10 @@ def main(args):
                     
                     break
     
+    # 在关闭 writer 之前记录最终最佳验证损失 (HParams metric)
+    with val_summary_writer.as_default():
+        tf.summary.scalar('hparams/best_eval_loss', best_eval_loss, step=0)
+
     # 训练结束后，关闭 summary writers
     train_summary_writer.close()
     val_summary_writer.close()
@@ -911,9 +915,7 @@ def main(args):
     print("Model weights saved as: {}".format(
         os.path.join(args.model_dir, "best_{}_{}.weights.h5".format(args.target, model_suffix))))
 
-    # 记录最终最佳验证损失到 HParams 关联的 metric（使用与 val writer）
-    with val_summary_writer.as_default():
-        tf.summary.scalar('hparams/best_eval_loss', best_eval_loss, step=0)
+    # (已在关闭前写入 hparams/best_eval_loss)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='RouteNet TF2 Implementation')

@@ -16,7 +16,7 @@ import argparse
 import re
 
 class ModelTrainer:
-    def __init__(self, base_dir="./", force_retrain=False, enable_early_stopping=True, epochs=20, early_stopping_patience=8, use_dropout=True, dropout_rate=0.1):
+    def __init__(self, base_dir="./", force_retrain=False, enable_early_stopping=True, epochs=20, early_stopping_patience=8, use_dropout=False, dropout_rate=0.1):
         self.base_dir = Path(base_dir)
         self.train_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "train"
         self.eval_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "evaluate"
@@ -103,12 +103,11 @@ class ModelTrainer:
         # Dropout 开关与比例（仅 routenet_tf2.py 支持；tf2_9 版本暂不透传）
         script_name = os.path.basename(str(self.train_script))
         if script_name == 'routenet_tf2.py':
-            # 新逻辑：默认关闭，如需开启则使用 --use_dropout
+            # 默认关闭；仅在启用时传递参数
             if self.use_dropout:
                 cmd.append("--use_dropout")
-            # 只有在启用 dropout 时传递 rate 更有意义，但保持兼容始终传递
-            if self.dropout_rate is not None:
-                cmd.extend(["--dropout_rate", str(self.dropout_rate)])
+                if self.dropout_rate is not None:
+                    cmd.extend(["--dropout_rate", str(self.dropout_rate)])
         
         # 添加早停机制参数
         if self.enable_early_stopping:
@@ -461,8 +460,8 @@ def main():
     parser.add_argument("--early-stopping-patience", type=int, default=8, help="早停耐心值 (默认: 8)")
     # 已移除 TF 版本切换功能，保留占位注释以便文档更新
     # Dropout 控制
-    parser.add_argument("--no-dropout", dest="use_dropout", action="store_false", help="禁用读出层的dropout（默认启用）")
-    parser.add_argument("--dropout-rate", dest="dropout_rate", type=float, default=0.1, help="读出层dropout比例 (默认 0.1)")
+    parser.add_argument("--use-dropout", dest="use_dropout", action="store_true", help="启用读出层dropout (默认关闭)")
+    parser.add_argument("--dropout-rate", dest="dropout_rate", type=float, default=0.1, help="读出层dropout比例 (启用后默认 0.1)")
     
     args = parser.parse_args()
     
