@@ -402,7 +402,7 @@ def main():
         'T': 3,
         'readout_units': 8,
         # IMPORTANT: must match training architecture; training default was 1
-        'readout_layers': 1,
+        'readout_layers': 2,
         'l2': 0.1,
         'l2_2': 0.01,
     }
@@ -461,20 +461,58 @@ def main():
         print("Model loaded successfully!")
     except Exception as e:
         print(f"[LoadWarning] Initial load failed: {e}")
-        # Heuristic fallback: if mismatch likely due to readout_layers, retry with 1 layer
-        if config.get('readout_layers', 1) != 1:
-            print("[LoadFallback] Retrying with readout_layers=1 (training default)...")
-            config['readout_layers'] = 1
-            delay_model, _ = load_model(
+        # Attempt intelligent fallbacks:
+        # 1) Toggle final layer usage (single-readout vs full) if mismatch suspected
+        attempted = False
+        if args.single_readout:
+            print("[LoadFallback] Detected single-readout mode; retrying assuming weights include final Dense head...")
+            alt_model, _ = load_model(
                 args.model_dir, 'delay', config, use_kan=args.kan,
                 use_final_layer=True
             )
             for features, labels in nsfnet_dataset.take(1):
-                _ = delay_model(features, training=False)
+                _ = alt_model(features, training=False)
                 break
-            delay_model.load_weights(delay_weight_path)
-            print("[LoadFallback] Model loaded successfully with readout_layers=1")
+            try:
+                alt_model.load_weights(delay_weight_path)
+                delay_model = alt_model
+                print("[LoadFallback] Successfully loaded by enabling final layer (weights include Dense head).")
+                attempted = True
+            except Exception as ee:
+                print(f"[LoadFallback] Retry with final layer also failed: {ee}")
         else:
+            print("[LoadFallback] Not single-readout; retrying assuming single-readout weights (no final Dense head)...")
+            alt_model, _ = load_model(
+                args.model_dir, 'delay', config, use_kan=args.kan,
+                use_final_layer=False
+            )
+            for features, labels in nsfnet_dataset.take(1):
+                _ = alt_model(features, training=False)
+                break
+            try:
+                alt_model.load_weights(delay_weight_path)
+                delay_model = alt_model
+                print("[LoadFallback] Successfully loaded by disabling final layer (weights lack Dense head).")
+                attempted = True
+            except Exception as ee:
+                print(f"[LoadFallback] Retry without final layer also failed: {ee}")
+
+        # 2) Fallback adjusting readout_layers if still not loaded
+        if not attempted and config.get('readout_layers', 1) != 1:
+            print("[LoadFallback] Retrying with readout_layers=1 (training default)...")
+            config['readout_layers'] = 1
+            alt_model, _ = load_model(
+                args.model_dir, 'delay', config, use_kan=args.kan,
+                use_final_layer=not args.single_readout
+            )
+            for features, labels in nsfnet_dataset.take(1):
+                _ = alt_model(features, training=False)
+                break
+            alt_model.load_weights(delay_weight_path)
+            delay_model = alt_model
+            print("[LoadFallback] Model loaded successfully with readout_layers=1 after architecture adjustment")
+        elif not attempted:
+            # If all fallbacks failed, re-raise
             raise
     
     # single-readout 模式提示输出形状确认

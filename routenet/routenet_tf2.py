@@ -663,16 +663,27 @@ def main(args):
     if args.dropout_rate is not None:
         config['dropout_rate'] = float(args.dropout_rate)
 
+    # ----------------------------------------------------------------------------------
+    # SINGLE-READOUT ARCHITECTURE FIX
+    # 之前的实现仅在模型创建之后再把 config['readout_layers'] 改成 1，导致实际训练仍然使用了2层读出：
+    #   [KAN(8) -> KAN(2)] 而不是真正的一层 KAN(2)。
+    # 这会造成评估阶段按 1 层构建模型时无法匹配权重 (权重文件里有 kan_layer 与 kan_layer_1)。
+    # 这里将覆盖逻辑提前到创建模型之前，确保训练与评估结构一致。
+    # ----------------------------------------------------------------------------------
+    if not getattr(args, 'use_final_layer', True):  # single-readout 模式
+        if config.get('readout_layers', 1) != 1:
+            print('[Fix] single-readout 模式：在创建模型之前强制 config.readout_layers=1 (原值: {})'.format(config.get('readout_layers')))
+            config['readout_layers'] = 1
+
     model, loss_fn = create_model_and_loss_fn(
         config,
         args.target,
         use_kan=args.kan,
         use_final_layer=getattr(args, 'use_final_layer', True)
     )
-    # 如果是 single-readout 模式，提醒并强制 readout_layers=1（模型内部已按 use_final_layer=False 构建）
+    # 创建后再次确认（理论上不会再触发，除非上面逻辑被改动）
     if not args.use_final_layer and config.get('readout_layers', 1) != 1:
-        print('[Info] Overriding config.readout_layers -> 1 for single-readout mode')
-        config['readout_layers'] = 1
+        print('[Warn] 创建模型后发现 readout_layers 仍 !=1, 当前值: {}. 这可能导致加载不兼容权重。'.format(config.get('readout_layers')))
 
     # ------------------------------------------------------------------
     # HParams: 定义与记录 (仅在单次运行目录即可被插件识别)

@@ -8,7 +8,7 @@ global_settings:
   gbn_test_dir: "data/routenet/gbnbw/tfrecords/evaluate"
 
   # 模型目录基础路径（与 train_models.py 保持一致）
-  models_base_dir: "kan_model/137-oneread"
+  models_base_dir: "kan_model/137-tworead"
 
   # 实验参数
   batch_size: 32
@@ -29,19 +29,19 @@ global_settings:
   num_samples: 2000
 
   # 输出根目录
-  base_output_dir: "experiment_results/kan_model/137-oneread"
+  base_output_dir: "experiment_results/kan_model/137-tworead"
 
 # 模型配置方案（由运行器自动生成 models）
 model_configs:
   - type: "mlp"
     physics: "none"
     enabled: true
-    no_final_layer: true
+    single_readout: true
 
   - type: "kan"
     physics: "none"
     enabled: true  # KAN-Poly
-    no_final_layer: true
+    single_readout: true
 
   - type: "kan_bspline"
     physics: "none"
@@ -49,7 +49,7 @@ model_configs:
     kan_basis: "bspline"
     kan_grid_size: 5
     kan_spline_order: 3
-    no_final_layer: true
+    single_readout: true
 
 # 实验定义
 experiments:

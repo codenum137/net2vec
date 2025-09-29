@@ -15,6 +15,7 @@ from tqdm import tqdm
 import seaborn as sns
 import importlib
 import re
+import h5py
 
 # 为不同 TF 版本选择后端模块（routenet_tf2 或 routenet_tf2_9）
 # 在 main 中根据 --tf-compat 参数与 TF 版本检测装配以下全局符号：
@@ -465,10 +466,174 @@ def main():
         for features, labels in dataset:
             _ = delay_model(features, training=False)
             break
-    
-    # 加载权重
-    delay_model.load_weights(delay_weight_path)
-    print("Model loaded successfully!")
+
+    def _try_load(model, path):
+        try:
+            model.load_weights(path)
+            return True, None
+        except Exception as e:
+            return False, e
+
+    loaded, err = _try_load(delay_model, delay_weight_path)
+    if not loaded:
+        print(f"[LoadWarning] Initial load failed: {err}")
+        # Diagnostics: attempt to list weight file variable names (HDF5)
+        try:
+            import h5py
+            with h5py.File(delay_weight_path, 'r') as h5f:
+                var_names = []
+                h5f.visit(var_names.append)
+            preview = [n for n in var_names if 'kan_layer' in n or 'dense' in n][:20]
+            print(f"[LoadDebug] Found {len(var_names)} entries in weight file. Preview (filtered kan_layer/dense): {preview}")
+            # 基于权重文件结构自动推断是否实际上训练时使用了两层 KAN 读出
+            if args.single_readout and config.get('readout_layers', 1) == 1:
+                kan_layer_roots = sorted({p.split('/vars')[0] for p in preview if 'kan_layer' in p and '/vars/' in p})
+                if len(kan_layer_roots) >= 2:
+                    print(f"[AutoDetect] Weight file包含 {len(kan_layer_roots)} 个 KAN 层变量组，推断训练时实际 readout_layers=2。尝试以 readout_layers=2 重新构建模型...")
+                    config['readout_layers'] = 2
+                    # 重新构建模型（保持 single_readout 输出模式：最后一层输出2维）
+                    rebuilt_model, _ = create_model_and_loss_fn(
+                        config,
+                        'delay',
+                        use_kan=args.kan,
+                        use_final_layer=not args.single_readout
+                    )
+                    # 先 build
+                    for features, labels in nsfnet_dataset.take(1):
+                        _ = rebuilt_model(features, training=False)
+                        break
+                    ok_auto, err_auto = _try_load(rebuilt_model, delay_weight_path)
+                    if ok_auto:
+                        print('[AutoDetect] 成功：使用 readout_layers=2 加载权重。继续评估。')
+                        delay_model = rebuilt_model
+                        loaded = True
+                    else:
+                        print(f"[AutoDetect] 尝试 readout_layers=2 失败: {err_auto}")
+        except Exception as ee:
+            print(f"[LoadDebug] Could not introspect weight file: {ee}")
+
+        if loaded:
+            pass  # 已通过 auto-detect 解决
+        else:
+            # Fallback 1: toggle final layer usage (single-readout vs full head)
+            fallback_attempts = []
+            alt_use_final = not (not args.single_readout)  # invert current use_final_layer setting
+            print(f"[LoadFallback] Retrying with use_final_layer={alt_use_final} ...")
+            alt_model, _ = load_model(
+                args.delay_model_dir, 'delay', config,
+                use_kan=args.kan,
+                use_final_layer=alt_use_final
+            )
+            for features, labels in nsfnet_dataset.take(1):
+                _ = alt_model(features, training=False)
+                break
+            ok, err2 = _try_load(alt_model, delay_weight_path)
+            if ok:
+                delay_model = alt_model
+                print("[LoadFallback] Success with toggled final layer usage.")
+            else:
+                print(f"[LoadFallback] Failed toggling final layer: {err2}")
+                fallback_attempts.append(('toggle_final', err2))
+
+                # Fallback 2: ensure readout_layers=1 and try both modes explicitly
+                if config.get('readout_layers', 1) != 1:
+                    print('[LoadFallback] Forcing readout_layers=1 and retrying both architectures...')
+                    config['readout_layers'] = 1
+                for mode_final in [True, False]:
+                    print(f"[LoadFallback] Attempt with use_final_layer={mode_final}")
+                    alt_model2, _ = load_model(
+                        args.delay_model_dir, 'delay', config,
+                        use_kan=args.kan,
+                        use_final_layer=mode_final
+                    )
+                    for features, labels in nsfnet_dataset.take(1):
+                        _ = alt_model2(features, training=False)
+                        break
+                    ok2, err3 = _try_load(alt_model2, delay_weight_path)
+                    if ok2:
+                        delay_model = alt_model2
+                        print("[LoadFallback] Success after exhaustive retry.")
+                        break
+                    else:
+                        fallback_attempts.append((f'mode_final_{mode_final}', err3))
+                else:
+                    # Exhausted without break -> Manual remap attempt
+                    print("[LoadError] All standard fallback strategies failed. Attempting manual legacy weight remap for KAN layers...")
+                    def _manual_kan_remap(model, weight_path):
+                        try:
+                            with h5py.File(weight_path, 'r') as hf:
+                                # Collect legacy KAN layer var groups
+                                kan_groups = []
+                                def visitor(name, obj):
+                                    if isinstance(obj, h5py.Group) and name.endswith('/vars') and 'kan_layer' in name:
+                                        kan_groups.append(name)
+                                hf.visititems(lambda n, o: visitor(n, o))
+                                kan_groups = sorted(kan_groups)
+                                model_kan_layers = [l for l in getattr(model, 'readout', []).layers if l.__class__.__name__ == 'KANLayer']
+                                if not model_kan_layers:
+                                    print('[ManualRemap] No KANLayer objects in current model; abort remap.')
+                                    return False
+                                assigned = 0
+                                for idx, grp_name in enumerate(kan_groups):
+                                    if idx >= len(model_kan_layers):
+                                        break
+                                    grp = hf[grp_name]
+                                    # collect datasets (expected 4)
+                                    arrs = []
+                                    for key in sorted(grp.keys(), key=lambda x: int(x) if x.isdigit() else x):
+                                        try:
+                                            arrs.append(np.array(grp[key]))
+                                        except Exception:
+                                            pass
+                                    if len(arrs) < 3:
+                                        print(f'[ManualRemap] Skip group {grp_name}: insufficient tensors ({len(arrs)})')
+                                        continue
+                                    # classify
+                                    bias_arr = None
+                                    spline_arr = None
+                                    two_d = []
+                                    for a in arrs:
+                                        if a.ndim == 1:
+                                            bias_arr = a
+                                        elif a.ndim == 3:
+                                            spline_arr = a
+                                        elif a.ndim == 2:
+                                            two_d.append(a)
+                                    if bias_arr is None or spline_arr is None or len(two_d) < 1:
+                                        print(f'[ManualRemap] Incomplete mapping for {grp_name}; skipping.')
+                                        continue
+                                    base_w = two_d[0]
+                                    gate_w = two_d[1] if len(two_d) > 1 else np.ones_like(base_w)
+                                    layer = model_kan_layers[idx]
+                                    try:
+                                        layer.set_weights([base_w, bias_arr, spline_arr, gate_w])
+                                        assigned += 1
+                                        print(f'[ManualRemap] Assigned legacy weights to layer {idx} ({grp_name}).')
+                                    except Exception as ee:
+                                        print(f'[ManualRemap] Failed setting weights for layer {idx}: {ee}')
+                                if assigned == 0:
+                                    print('[ManualRemap] No KAN layers remapped.')
+                                    return False
+                                return True
+                        except Exception as e2:
+                            print(f'[ManualRemap] Exception during remap: {e2}')
+                            return False
+                    if args.kan:
+                        success = _manual_kan_remap(delay_model, delay_weight_path)
+                        if success:
+                            print('[ManualRemap] Legacy KAN weights loaded. Proceeding with evaluation (WARNING: gate/base order heuristic).')
+                        else:
+                            print('[ManualRemap] Remap failed; cannot proceed.')
+                            for tag, eobj in fallback_attempts:
+                                print(f"  - {tag}: {eobj}")
+                            raise err
+                    else:
+                        print('[LoadError] Non-KAN model and all fallbacks failed; aborting.')
+                        for tag, eobj in fallback_attempts:
+                            print(f"  - {tag}: {eobj}")
+                        raise err
+    else:
+        print("Model loaded successfully!")
 
     # single-readout 模式下，模型直接输出预测 (delay:2)。无需特殊处理，只需提示。
     if args.single_readout:

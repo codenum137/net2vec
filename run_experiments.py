@@ -245,10 +245,10 @@ class ExperimentRunner:
                         cmd.extend(["--kan_grid_size", str(model_config['kan_grid_size'])])
                     if model_config.get('kan_spline_order') is not None:
                         cmd.extend(["--kan_spline_order", str(model_config['kan_spline_order'])])
-            # numerical 分析脚本当前未显式支持 single-readout 标志；如后续需要，可在脚本中加入同名参数。
-            # 这里暂不传递避免未知参数错误；如果未来 numerical 支持，需要在此处追加 --single-readout。
+            # numerical 分析脚本现已支持 --single-readout
             if model_config.get('single_readout'):
-                print(f"ℹ️  numerical: 模型 {model_name} 为 single_readout -> 未传递标志 (脚本暂未支持，确保脚本能根据权重正确加载)")
+                cmd.append("--single-readout")
+                print(f"ℹ️  numerical: 模型 {model_name} 为 single_readout -> 添加 --single-readout")
         
         return cmd, output_dir
     
