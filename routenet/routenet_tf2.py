@@ -789,6 +789,20 @@ def main(args):
             
         avg_eval_loss = total_eval_loss / eval_step_count
 
+        # 将评估损失转换为 Python float 以便进行逻辑比较（避免 Tensor 与 None/float 比较问题）
+        try:
+            import tensorflow as _tf_internal
+            if _tf_internal.is_tensor(avg_eval_loss):
+                avg_eval_loss_value = float(avg_eval_loss.numpy())
+            else:
+                avg_eval_loss_value = float(avg_eval_loss)
+        except Exception:
+            # 回退策略
+            try:
+                avg_eval_loss_value = float(avg_eval_loss)
+            except Exception:
+                avg_eval_loss_value = None
+
         # 记录验证损失
         with val_summary_writer.as_default():
             tf.summary.scalar('epoch_loss', avg_eval_loss, step=epoch + 1)
@@ -799,35 +813,44 @@ def main(args):
             tf.summary.scalar('learning_rate_epoch', current_lr, step=epoch + 1)
 
         # 如果使用ReduceLROnPlateau，手动调整学习率
-        if reduce_lr_callback is not None:
-            # 模拟callback行为
-            if not hasattr(reduce_lr_callback, 'best'):
-                reduce_lr_callback.best = avg_eval_loss
+        if reduce_lr_callback is not None and avg_eval_loss_value is not None:
+            # 模拟 callback 行为，使用 Python float；首次或 None 初始化
+            if (not hasattr(reduce_lr_callback, 'best')) or (getattr(reduce_lr_callback, 'best', None) is None):
+                reduce_lr_callback.best = avg_eval_loss_value
                 reduce_lr_callback.wait = 0
             else:
-                if avg_eval_loss < reduce_lr_callback.best:
-                    reduce_lr_callback.best = avg_eval_loss
+                if avg_eval_loss_value < reduce_lr_callback.best:
+                    reduce_lr_callback.best = avg_eval_loss_value
                     reduce_lr_callback.wait = 0
                 else:
                     reduce_lr_callback.wait += 1
                     if reduce_lr_callback.wait >= args.plateau_patience:
-                        old_lr = optimizer.learning_rate.numpy()
+                        old_lr = float(optimizer.learning_rate.numpy()) if hasattr(optimizer.learning_rate, 'numpy') else float(optimizer.learning_rate)
                         new_lr = old_lr * args.plateau_factor
                         if new_lr >= args.learning_rate * 0.001:
-                            optimizer.learning_rate.assign(new_lr)
+                            if hasattr(optimizer.learning_rate, 'assign'):
+                                optimizer.learning_rate.assign(new_lr)
+                            else:
+                                # 若是纯浮点 schedule（固定学习率）
+                                optimizer.learning_rate = new_lr
                             print("Reducing learning rate from {:.6f} to {:.6f}".format(old_lr, new_lr))
                             reduce_lr_callback.wait = 0
 
         # 输出epoch结果
         print("Epoch {} finished. Avg Train Loss: {:.4f}, Avg Eval Loss: {:.4f}, LR: {:.6f}".format(
-            epoch + 1, avg_train_loss, avg_eval_loss, 
+            epoch + 1,
+            float(avg_train_loss.numpy()) if hasattr(avg_train_loss, 'numpy') else float(avg_train_loss),
+            avg_eval_loss_value if avg_eval_loss_value is not None else float('nan'),
             optimizer.learning_rate.numpy() if hasattr(optimizer.learning_rate, 'numpy') else optimizer.learning_rate))
 
         # 保存最佳模型
-        if avg_eval_loss < best_eval_loss - early_stopping_min_delta if args.early_stopping else avg_eval_loss < best_eval_loss:
+        if (
+            (args.early_stopping and avg_eval_loss_value is not None and (avg_eval_loss_value < best_eval_loss - early_stopping_min_delta))
+            or ((not args.early_stopping) and avg_eval_loss_value is not None and (avg_eval_loss_value < best_eval_loss))
+        ):
             print("Evaluation loss improved from {:.4f} to {:.4f}. Saving model...".format(
-                best_eval_loss, avg_eval_loss))
-            best_eval_loss = avg_eval_loss
+                best_eval_loss, avg_eval_loss_value))
+            best_eval_loss = avg_eval_loss_value
             
             # 根据是否使用KAN来命名模型文件
             model_suffix = "kan_model" if args.kan else "model"
