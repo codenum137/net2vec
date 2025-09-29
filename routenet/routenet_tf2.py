@@ -327,10 +327,12 @@ def create_dataset(filenames, batch_size, is_training=True, seed=None):
 # ==============================================================================
 
 class RouteNet(tf.keras.Model):
-    def __init__(self, config, output_units=2, final_activation=None, use_kan=False):
+    def __init__(self, config, output_units=2, final_activation=None, use_kan=False, use_final_layer=True):
         super().__init__()
         self.config = config
         self.use_kan = use_kan
+        # 控制是否使用最终输出层（Dense 预测头）
+        self.use_final_layer = use_final_layer
         
         # 消息传递层（与原版保持一致的命名）
         self.link_update = tf.keras.layers.GRUCell(config['link_state_dim'])  # 原版中叫 edge_update
@@ -377,12 +379,15 @@ class RouteNet(tf.keras.Model):
                     )
             self.readout = tf.keras.Sequential(readout_layers)
         
-        # 最终输出层，支持不同的激活函数
-        self.final_layer = tf.keras.layers.Dense(
-            output_units,
-            activation=final_activation,
-            kernel_regularizer=tf.keras.regularizers.l2(config['l2_2'])
-        )
+        # 最终输出层，支持不同的激活函数；仅当启用时创建
+        if self.use_final_layer:
+            self.final_layer = tf.keras.layers.Dense(
+                output_units,
+                activation=final_activation,
+                kernel_regularizer=tf.keras.regularizers.l2(config['l2_2'])
+            )
+        else:
+            self.final_layer = None  # 仅作占位，前向传播中会跳过
 
     def call(self, inputs, training=False):
         # 初始化状态
@@ -447,6 +452,9 @@ class RouteNet(tf.keras.Model):
         # 读出阶段
         readout_output = self.readout(path_state, training=training)
         final_input = tf.concat([readout_output, path_state], axis=1)
+        # 如果禁用最终层，直接返回拼接后的特征表示（可能用于下游任务或探针）
+        if not self.use_final_layer:
+            return final_input
         return self.final_layer(final_input)
 
 
@@ -512,20 +520,23 @@ def binomial_loss(y_true, y_pred):
     
     return loss
 
-def create_model_and_loss_fn(config, target, use_kan=False):
+def create_model_and_loss_fn(config, target, use_kan=False, use_final_layer=True):
     """根据target参数创建相应的模型和损失函数（无物理/梯度约束）。"""
     model_type = "KAN-based" if use_kan else "MLP-based"
 
     if target == 'delay':
-        model = RouteNet(config, output_units=2, final_activation=None, use_kan=use_kan)
+        model = RouteNet(config, output_units=2, final_activation=None, use_kan=use_kan, use_final_layer=use_final_layer)
         loss_fn = heteroscedastic_loss
         print("Created {} delay prediction model with standard heteroscedastic loss".format(model_type))
     elif target == 'drops':
-        model = RouteNet(config, output_units=1, final_activation=None, use_kan=use_kan)
+        model = RouteNet(config, output_units=1, final_activation=None, use_kan=use_kan, use_final_layer=use_final_layer)
         loss_fn = binomial_loss
         print("Created {} drop prediction model with binomial loss".format(model_type))
     else:
         raise ValueError("Unsupported target: {}. Choose 'delay' or 'drops'".format(target))
+
+    if not use_final_layer:
+        print("[Warning] Final output layer disabled: model outputs raw concatenated features (readout + path_state). Ensure your loss / downstream usage is compatible.")
 
     return model, loss_fn
 
@@ -574,7 +585,7 @@ def main(args):
         'path_state_dim': 2, 
         'T': 3,
         'readout_units': 8,
-        'readout_layers': 2,
+        'readout_layers': 1,
         'l2': 0.1,
         'l2_2': 0.01,
         # KAN 参数默认值（当使用KAN时生效）
@@ -627,7 +638,12 @@ def main(args):
     if args.dropout_rate is not None:
         config['dropout_rate'] = float(args.dropout_rate)
 
-    model, loss_fn = create_model_and_loss_fn(config, args.target, use_kan=args.kan)
+    model, loss_fn = create_model_and_loss_fn(
+        config,
+        args.target,
+        use_kan=args.kan,
+        use_final_layer=getattr(args, 'use_final_layer', True)
+    )
 
     # ------------------------------------------------------------------
     # HParams: 定义与记录 (仅在单次运行目录即可被插件识别)
@@ -979,10 +995,15 @@ if __name__ == '__main__':
                       help='Estimated steps per epoch for cosine/polynomial schedules')
     parser.add_argument('--seed', type=int, default=137,
                       help='Random seed for reproducibility (default: 137)')
+    # 控制是否使用最终输出层（关闭时输出读出层与路径状态的拼接向量）
+    parser.add_argument('--no_final_layer', action='store_true',
+                      help='Disable final Dense output layer and output raw concatenated features (readout + path_state)')
     
     args = parser.parse_args()
     
     if not os.path.exists(args.model_dir):
         os.makedirs(args.model_dir)
         
+    # 兼容：将标志转换为正逻辑参数
+    args.use_final_layer = not args.no_final_layer
     main(args)

@@ -20,7 +20,7 @@ class ModelTrainer:
         self.base_dir = Path(base_dir)
         self.train_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "train"
         self.eval_data_dir = self.base_dir / "data" / "routenet" / "nsfnetbw" / "tfrecords" / "evaluate"
-        self.models_base_dir = self.base_dir / "kan_model/0929"
+        self.models_base_dir = self.base_dir / "kan_model/137-oneread"
         self.force_retrain = force_retrain  # 是否强制重新训练已存在的模型
         self.enable_early_stopping = enable_early_stopping  # 是否启用早停机制
         self.epochs = epochs  # 训练轮数
@@ -85,7 +85,7 @@ class ModelTrainer:
             "--learning_rate", "0.001",
             "--plateau_patience", "8",  # 增加耐心值
             "--plateau_factor", "0.5",
-
+            "--no_final_layer"
         ]
         
         # 添加KAN相关参数
